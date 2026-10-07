@@ -130,6 +130,25 @@ You should see the PCI for the attached UE change to 2 in the output of the gNB 
 /local/repository/bin/handover ue1 ru1
 ```
 
+The OCUDU gNB publishes metrics in JSON format via WebSocket on port 8001. You can use the included `metrics-receiver.py` script to receive and log these metrics. The Python helper scripts in this profile are run with `uv`, which is installed on the `cudu` node and resolves their dependencies from the repository's `pyproject.toml`:
+
+```
+# On, e.g., the `cudu` node, run the following command to receive metrics and log them to a file:
+cd /local/repository
+uv run bin/metrics-receiver.py --output metrics.jsonl
+```
+
+There is another script `rrm-policy-set.py` that can be used to set RRM slice policy ratios on the running gNB, serving as an example for general CU/DU control via the websocket interface. See the script's help for usage information:
+
+```
+# On the `cudu` node, run the following command to see usage information:
+cd /local/repository
+uv run bin/rrm-policy-set.py -h
+```
+
+"""
+
+interGnbInstructions = """
 #### Inter-gNB handover with the second gNB
 
 The `cudu2` node runs a second, separate OCUDU gNB on the N300 (gNB ID 412, PCI 3), attached to the same Open5GS core. Each gNB lists the other's cell as an external neighbour, and with no Xn link configured the handover goes through the AMF (NG handover).
@@ -162,22 +181,6 @@ Attach `ue1` as above (it starts on gNB 1, PCI 1; the paths to gNB 2 start at ma
 The UE's row disappears from the metrics table on `cudu` and appears with PCI 3 on `cudu2`; `/local/repository/bin/handover-gnb ue1 gnb1` moves it back.
 
 Notes: the N300 gains in `gnb2_rf_n300_inter_ho.yml` are starting values and may need adjusting so both cells arrive at the UE at similar levels. The two radios run on their internal clocks, so the cells are not time aligned. `bin/update-attens gnb2ue1|gnb2ue2` assumes the first eight N300 paths belong to `ue1` and the rest to `ue2`; check against `bin/atten -l`.
-
-The OCUDU gNB publishes metrics in JSON format via WebSocket on port 8001. You can use the included `metrics-receiver.py` script to receive and log these metrics. The Python helper scripts in this profile are run with `uv`, which is installed on the `cudu` node and resolves their dependencies from the repository's `pyproject.toml`:
-
-```
-# On, e.g., the `cudu` node, run the following command to receive metrics and log them to a file:
-cd /local/repository
-uv run bin/metrics-receiver.py --output metrics.jsonl
-```
-
-There is another script `rrm-policy-set.py` that can be used to set RRM slice policy ratios on the running gNB, serving as an example for general CU/DU control via the websocket interface. See the script's help for usage information:
-
-```
-# On the `cudu` node, run the following command to see usage information:
-cd /local/repository
-uv run bin/rrm-policy-set.py -h
-```
 
 """
 
@@ -257,20 +260,6 @@ MATRIX_GRAPH = {
     "ue2": ["sdru", "sdru2"],
 }
 MATRIX_INPUTS = ["sdru", "sdru2"]
-RF_IFACES = {}
-RF_LINK_NAMES = {}
-for k, v in MATRIX_GRAPH.items():
-    RF_IFACES[k] = {}
-    for node in (v):
-        RF_IFACES[k][node] = "{}_{}_rf".format(k, node)
-        if k in MATRIX_INPUTS:
-            RF_LINK_NAMES["rflink_{}_{}".format(k, node)] = []
-
-for k, v in MATRIX_GRAPH.items():
-    if k in MATRIX_INPUTS:
-        for node in (v):
-            RF_LINK_NAMES["rflink_{}_{}".format(k, node)].append(RF_IFACES[k][node])
-            RF_LINK_NAMES["rflink_{}_{}".format(k, node)].append(RF_IFACES[node][k])
 
 pc = portal.Context()
 node_types = [
@@ -293,6 +282,13 @@ pc.defineParameter(
     typ=portal.ParameterType.STRING,
     defaultValue=node_types[1],
     legalValues=node_types
+)
+
+pc.defineParameter(
+    name="enable_second_gnb",
+    description="Include the second gNB (cudu2 + N300) for inter-gNB handover. Disable to instantiate with only the X310 gNB, e.g., when n300-2 is unavailable.",
+    typ=portal.ParameterType.BOOLEAN,
+    defaultValue=True
 )
 
 pc.defineParameter(
@@ -337,6 +333,29 @@ pc.defineParameter(
 
 params = pc.bindParameters()
 pc.verifyParameters()
+
+if not params.enable_second_gnb:
+    MATRIX_INPUTS.remove("sdru2")
+    MATRIX_GRAPH = dict(
+        (k, [n for n in v if n != "sdru2"])
+        for k, v in MATRIX_GRAPH.items() if k != "sdru2"
+    )
+
+RF_IFACES = {}
+RF_LINK_NAMES = {}
+for k, v in MATRIX_GRAPH.items():
+    RF_IFACES[k] = {}
+    for node in (v):
+        RF_IFACES[k][node] = "{}_{}_rf".format(k, node)
+        if k in MATRIX_INPUTS:
+            RF_LINK_NAMES["rflink_{}_{}".format(k, node)] = []
+
+for k, v in MATRIX_GRAPH.items():
+    if k in MATRIX_INPUTS:
+        for node in (v):
+            RF_LINK_NAMES["rflink_{}_{}".format(k, node)].append(RF_IFACES[k][node])
+            RF_LINK_NAMES["rflink_{}_{}".format(k, node)].append(RF_IFACES[node][k])
+
 request = pc.makeRequestRSpec()
 
 role = "cn5g"
@@ -394,33 +413,34 @@ sdr_link.addNode(sdru)
 sdru.Desire("rf-controlled", 1)
 matrix_nodes[node_name] = sdru
 
-node_name = "cudu2"
-cudu2 = request.RawPC(node_name)
-cudu2_cn_if = cudu2.addInterface("{}-cn-if".format(node_name))
-cudu2_cn_if.addAddress(pg.IPv4Address("192.168.1.3", "255.255.255.0"))
-cn_link.addInterface(cudu2_cn_if)
-cudu2.component_manager_id = COMP_MANAGER_ID
-cudu2.hardware_type = params.sdru2_nodetype
-if params.sdr_compute_image:
-    cudu2.disk_image = params.sdr_compute_image
-else:
-    cudu2.disk_image = UBUNTU_IMG
-node_sdr_if = cudu2.addInterface("{}-sdr-if".format(node_name))
-node_sdr_if.addAddress(pg.IPv4Address("192.168.10.1", "255.255.255.0"))
-sdr_link = request.Link("{}-sdr-link".format(node_name))
-# sdr_link.bandwidth = 10*1000*1000
-sdr_link.addInterface(node_sdr_if)
-cudu2.addService(pg.Execute(shell="bash", command=cmd))
-cudu2.addService(pg.Execute(shell="bash", command="/local/repository/bin/tune-sdr-iface.sh"))
-cudu2.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens gnb2ue1 95"))
-cudu2.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens gnb2ue2 95"))
+if params.enable_second_gnb:
+    node_name = "cudu2"
+    cudu2 = request.RawPC(node_name)
+    cudu2_cn_if = cudu2.addInterface("{}-cn-if".format(node_name))
+    cudu2_cn_if.addAddress(pg.IPv4Address("192.168.1.3", "255.255.255.0"))
+    cn_link.addInterface(cudu2_cn_if)
+    cudu2.component_manager_id = COMP_MANAGER_ID
+    cudu2.hardware_type = params.sdru2_nodetype
+    if params.sdr_compute_image:
+        cudu2.disk_image = params.sdr_compute_image
+    else:
+        cudu2.disk_image = UBUNTU_IMG
+    node_sdr_if = cudu2.addInterface("{}-sdr-if".format(node_name))
+    node_sdr_if.addAddress(pg.IPv4Address("192.168.10.1", "255.255.255.0"))
+    sdr_link = request.Link("{}-sdr-link".format(node_name))
+    # sdr_link.bandwidth = 10*1000*1000
+    sdr_link.addInterface(node_sdr_if)
+    cudu2.addService(pg.Execute(shell="bash", command=cmd))
+    cudu2.addService(pg.Execute(shell="bash", command="/local/repository/bin/tune-sdr-iface.sh"))
+    cudu2.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens gnb2ue1 95"))
+    cudu2.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens gnb2ue2 95"))
 
-node_name = "sdru2"
-sdru2 = request.RawPC("{}-sdr".format(node_name))
-sdru2.component_id = NODE_IDS[node_name]
-sdr_link.addNode(sdru2)
-sdru2.Desire("rf-controlled", 1)
-matrix_nodes[node_name] = sdru2
+    node_name = "sdru2"
+    sdru2 = request.RawPC("{}-sdr".format(node_name))
+    sdru2.component_id = NODE_IDS[node_name]
+    sdr_link.addNode(sdru2)
+    sdru2.Desire("rf-controlled", 1)
+    matrix_nodes[node_name] = sdru2
 
 # ue nodes with COTS UE and B210
 node_name = "ue1"
@@ -457,6 +477,8 @@ for rf_link_name, rf_iface_names in RF_LINK_NAMES.items():
 tour = ig.Tour()
 tour.Description(ig.Tour.MARKDOWN, tourDescription)
 instructions = tourInstructions
+if params.enable_second_gnb:
+    instructions += interGnbInstructions
 if params.enable_phy_tap:
     instructions += phyTapInstructions
 tour.Instructions(ig.Tour.MARKDOWN, instructions)
