@@ -1,0 +1,48 @@
+#!/bin/bash
+UPDATE_ATTENS_SCRIPT=/local/repository/bin/update-attens
+UE=$1
+DST_GNB=$2
+ATTEN_STEP=5
+START_ATTEN_SRC=0
+START_ATTEN_DST=60
+
+usage() {
+    cat <<EOF2
+usage:
+    handover-gnb -h
+        show this help message
+    handover-gnb <ue> <dst_gnb>
+        handover <ue> to <dst_gnb> using 5 dB atten steps
+        <dst_gnb> can be gnb1 (X310 on cudu) or gnb2 (N300 on cudu2)
+        (assumes <ue> is currently attached via the other gNB)
+        <ue> can be ue1 or ue2
+EOF2
+}
+
+if [ $# -lt 2 ]; then
+  usage; exit 1
+fi
+
+if [ $UE != "ue1" ] && [ $UE != "ue2" ]; then
+  echo "invalid ue"; usage; exit 1
+fi
+
+if [ $DST_GNB == "gnb1" ]; then
+  DST_GROUP="ru1${UE}"
+  SRC_GROUP="gnb2${UE}"
+elif [ $DST_GNB == "gnb2" ]; then
+  DST_GROUP="gnb2${UE}"
+  SRC_GROUP="ru1${UE}"
+else
+  echo "invalid dst_gnb"; usage; exit 1
+fi
+
+handover() {
+  echo "handing over $UE to $DST_GNB..."
+  for atten in $(seq $START_ATTEN_SRC $ATTEN_STEP $START_ATTEN_DST); do
+    $UPDATE_ATTENS_SCRIPT $SRC_GROUP $((START_ATTEN_SRC + atten))
+    $UPDATE_ATTENS_SCRIPT $DST_GROUP $((START_ATTEN_DST - atten))
+  done
+}
+
+handover

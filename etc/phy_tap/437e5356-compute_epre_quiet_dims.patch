@@ -1,0 +1,30 @@
+# Applies to ocudu/plugin_examples/phy_tap_plugin_example at commit
+# 437e53563b4dd9b1b8acdf669fd7f487b561a99b ("phy: add tdd pattern to quiet
+# symbol processing", 2026-05-07). Must match PHY_TAP_COMMIT_HASH in
+# bin/common.sh; re-verify with `git apply --check` if that pin changes.
+#
+# Upstream compute_epre() sizes its output from members that are only set in
+# process() (allocated UL slots). With enable_quiet_processing and no UE
+# scheduled yet, process_quiet() therefore emits 0-byte ZMQ messages. Take the
+# dimensions from the resource grid instead.
+diff --git a/lib/external_processors/tap_ul_resource_grid_epre_zmq.cpp b/lib/external_processors/tap_ul_resource_grid_epre_zmq.cpp
+index 4576f90..4df2fa6 100644
+--- a/lib/external_processors/tap_ul_resource_grid_epre_zmq.cpp
++++ b/lib/external_processors/tap_ul_resource_grid_epre_zmq.cpp
+@@ -10,6 +10,16 @@ using namespace ocudu;
+
+ void tap_ul_resource_grid_epre_zmq::compute_epre(const resource_grid_reader& grid_reader)
+ {
++  // Take the dimensions from the grid itself: when only quiet slots have been processed so far
++  // (e.g. no UE attached yet), process() has never run and the cached members are still zero,
++  // which resulted in empty ZMQ messages.
++  nof_symbols = grid_reader.get_nof_symbols();
++  nof_ports   = grid_reader.get_nof_ports();
++  nof_subc    = grid_reader.get_nof_subc();
++  if ((nof_subc == 0) || (nof_ports == 0) || (nof_symbols == 0)) {
++    return;
++  }
++
+   auto prb_epre_buffer = temp_buffers.get();
+   if (!prb_epre_buffer) {
+     logger.warning("Failed to get temporary buffer.");

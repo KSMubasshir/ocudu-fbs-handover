@@ -1,0 +1,21 @@
+[project]
+name = "srs-rf-matrix"
+version = "0.1.0"
+description = "Helper scripts for the srs-rf-matrix POWDER profile (run with `uv run` from this directory)"
+requires-python = ">=3.10"
+# One dependency list for every node role; each node runs `uv sync` at setup
+# (bin/install-uv.sh), so unused packages cost only disk.
+dependencies = [
+    # cudu node
+    "pyzmq",          # bin/epre-sink.py, bin/quectel_control.py (UE)
+    "numpy",          # bin/epre-sink.py
+    "matplotlib",     # bin/epre-sink.py --plot
+    "websockets",     # bin/metrics-receiver.py, bin/rrm-policy-set.py
+    # UE nodes
+    "pyserial",       # bin/quectel_control.py (modem AT port)
+    "textual==0.32.0" # bin/ue_app.py (written against this textual API)
+]
+
+[tool.uv]
+# Scripts only; nothing to build or install as a package.
+package = false
