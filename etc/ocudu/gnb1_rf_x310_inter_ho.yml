@@ -71,6 +71,8 @@ cell_cfg:
   plmn: "99999"
   tac: 1
   pci: 1
+  ssb:
+    ssb_period: 5
   prach:
     prach_root_sequence_index: 0
 

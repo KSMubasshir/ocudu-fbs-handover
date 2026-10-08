@@ -39,6 +39,19 @@ before running anything below.
 sudo journalctl -u open5gs-amfd -u open5gs-smfd -f --output cat
 ```
 
+### Restart the core (cn5g)
+
+Stop the gNBs first and start them again afterwards so they re-register with
+the AMF.
+
+```
+sudo systemctl restart 'open5gs-*'
+```
+
+```
+systemctl list-units 'open5gs-*' --no-pager
+```
+
 ## 2. Intra-gNB handover (X310, PCI 1 <-> PCI 2)
 
 ### cudu: start the gNB
@@ -87,10 +100,38 @@ Stop the gNB from section 2 first (Ctrl-C).
 
 ### cudu AND cudu2: fill in the SSB ARFCN (once)
 
-Replace `<dl_ssb_arfcn>` with the value noted in section 2.
+Set `ARFCN` to the number noted in section 2 (digits only), then run the sed.
+It rewrites the whole `ssb_arfcn:` line, so it is safe to re-run.
 
 ```
-sudo sed -i "s/SSBARFCN/<dl_ssb_arfcn>/" /var/tmp/etc/ocudu/gnb*_inter_ho.yml
+ARFCN=632256
+```
+
+```
+sudo sed -i "s/ssb_arfcn: .*/ssb_arfcn: $ARFCN/" /var/tmp/etc/ocudu/gnb*_inter_ho.yml
+```
+
+```
+grep -n ssb_arfcn /var/tmp/etc/ocudu/gnb*_inter_ho.yml
+```
+
+### cudu AND cudu2: 5 ms SSB period (once, only on nodes deployed before the repo fix)
+
+Without this the gNB starts but rejects its own cell (`F1 Setup Failure` in
+`/tmp/gnb.log`) and no UE can attach.
+
+```
+sudo sed -i -e 's/^  pci: \([0-9]*\)$/  pci: \1\n  ssb:\n    ssb_period: 5/' /var/tmp/etc/ocudu/gnb*_inter_ho.yml
+```
+
+```
+grep -n -A2 "^  pci:" /var/tmp/etc/ocudu/gnb*_inter_ho.yml
+```
+
+After starting a gNB, confirm the cell was accepted (no output means it was):
+
+```
+grep -n "F1 Setup Failure\|Invalid cell measurement" /tmp/gnb.log
 ```
 
 ### cudu: start gNB 1
@@ -160,6 +201,28 @@ Groups: `ru1ue1`, `ru2ue1`, `ru1ue2`, `ru2ue2`, `gnb2ue1`, `gnb2ue2`, `uemon`
 
 ```
 /local/repository/bin/module-off.sh
+```
+
+### Modem requests the wrong slice (AMF log: `Cannot find Requested NSSAI`, `Registration reject [62]`)
+
+The modem keeps slice settings from earlier experiments. Show what it holds:
+
+```
+sudo sh -c "chat -t 3 -sv '' AT OK 'AT+C5GNSSAIRDP=3' OK < /dev/ttyUSB2 > /dev/ttyUSB2"
+```
+
+Set the default slice to SST 1 / SD 1, then cycle the modem:
+
+```
+sudo bash -c 'chat -t 3 -sv "" AT OK "AT+C5GNSSAI=4,\"01.000001\"" OK < /dev/ttyUSB2 > /dev/ttyUSB2'
+```
+
+```
+/local/repository/bin/module-airplane.sh
+```
+
+```
+/local/repository/bin/module-on.sh
 ```
 
 These drive the AT port directly and conflict with a running `quectel-control`
