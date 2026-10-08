@@ -1,0 +1,22 @@
+#!/bin/bash
+# Capture the NGAP traffic between the AMF and all gNBs. Run on cn5g; Ctrl-C to stop.
+OUT=${1:-/tmp/ngap-$(date +%Y%m%d-%H%M%S).pcap}
+
+if [ "$1" == "-h" ]; then
+    cat <<EOF2
+usage:
+    ngap-capture [<file>]
+        capture NGAP (SCTP port 38412) on the core LAN into <file>
+        (default /tmp/ngap-<date>-<time>.pcap) until Ctrl-C
+        read it back with: tshark -r <file> -Y ngap
+EOF2
+    exit 0
+fi
+
+LANIF=$(ip -4 -o addr show | awk '$4 ~ /^192\.168\.1\./{print $2}')
+if [ -z "$LANIF" ]; then
+    echo "no 192.168.1.x interface; run this on cn5g"; exit 1
+fi
+
+echo "capturing NGAP on $LANIF to $OUT (Ctrl-C to stop)"
+exec sudo tcpdump -i $LANIF -U -w $OUT sctp port 38412

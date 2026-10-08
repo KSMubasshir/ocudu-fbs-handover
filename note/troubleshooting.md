@@ -15,11 +15,13 @@ fail with `Unmatched '''.`; wrap them as `sudo bash -c '...'` instead.
 | Is the gNB keeping up with the radio? | gNB console | `Late` / `Underflow` / `Overflow` lines should be absent or small |
 | Did the UE reach the core, and was it rejected? | cn5g | `sudo journalctl -u open5gs-amfd --no-pager --output cat \| tail -n 40` |
 | What cell does the modem see? | ue1 / ue2 | `sudo bash -c 'chat -t 5 -sv "" AT OK "AT+QENG=\"servingcell\"" OK < /dev/ttyUSB2 > /dev/ttyUSB2'` |
-| Does the UE report a neighbour cell? | cudu | `grep -n "measResultNeighCells" /tmp/gnb.log \| tail` |
+| Does the UE report a neighbour cell? | cudu | `grep -a -c "measResultNeighCells" /tmp/gnb.log` |
+| Did a handover run, and how did it end? | cudu / cudu2 | `grep -a "NGAP.*Handover\|Could not find" /tmp/gnb.log` |
 | Which attenuator paths exist? | cudu / cudu2 | `/local/repository/bin/atten -l` |
 
-`/tmp/gnb.log` is buffered. On an idle gNB it can stop mid-line at startup and
-only catch up when the process exits.
+`/tmp/gnb.log` is buffered. On an idle gNB it can stop mid-line and only catch
+up when there is more traffic or the process exits, so a missing line does not
+mean the event did not happen.
 
 ## 1. gNB will not start: `Could not convert: --ssb_arfcn = <dl_ssb_arfcn>`
 
@@ -162,88 +164,106 @@ network. The fallback is to make the network accept SD 2 for ue2: add it to
 the AMF and NSSF configs, both gNB configs, and the ue2 subscriber entry, then
 restart the core and both gNBs.
 
-## 6. Inter-gNB handover never starts
+## 6. Inter-gNB handover never starts from the attenuators
 
 **Symptom.** `handover-gnb ue1 gnb2` runs, ue1 stays on PCI 1 and its signal
-drops (about -112 dBm), nothing appears on cudu2.
+drops to about -112 dBm, nothing appears on cudu2. Same in the other direction.
 
 **What the logs show.**
 
 - gNB 1 sends the correct measurement config: SSB frequency 632256, 5 ms
-  window, event A3 with a 3 dB offset.
-- ue1's periodic reports list only PCI 1. No neighbour is ever reported, and
-  the modem's neighbour-cell query is empty.
-- No handover messages in gNB 1's log or the AMF log.
-- gNB 2 is running and streaming samples to the N300.
+  window, event A3 linked to it.
+- ue1's periodic reports list only the serving cell. `measResultNeighCells`
+  never appears, and the modem's `AT+QENG="neighbourcell"` is empty, even with
+  the other cell 30 dB stronger.
+- No `HandoverRequired` in either gNB log or in the AMF log.
+
+**Cause.** The two cells are not time-aligned, and the modem only measures a
+same-carrier neighbour whose timing it already knows. Evidence: straight after
+a forced handover (below) the UE reported its old cell as a neighbour once
+with a real level, then lost it within half a second.
+
+The radios cannot be aligned as cabled (checked 2026-10-08 with the UHD Python
+API, gNBs stopped):
+
+| | X310 (cudu) | N300 (cudu2) |
+|---|---|---|
+| External 10 MHz | locks | locks |
+| External PPS | none (last-PPS time never advances) | none (`Failed to capture PPS`) |
+| GPS | no GPSDO | `gps_locked = false` |
+
+So `clock: external` gives a common frequency but not common frame timing.
+`sync: external` on the X310 does no harm but aligns nothing.
 
 **Ruled out.**
 
 - Attenuator paths: `atten -l` matches the numbers in `bin/update-attens`.
-- gNB 2 and its RF path: ue1 attaches directly to PCI 3 with a clean link
-  (CQI 15, 0% BLER) when gNB 1 is faded out:
+- gNB 2 and its RF path: with gNB 1 at 95, a modem cycle makes ue1 attach
+  directly to PCI 3 at -81 dBm (CQI 15, 0% BLER).
+- `deriveSSB-IndexFromCell`: OCUDU hardcodes it to `true`, which tells the UE
+  the neighbour shares the serving cell's timing. Patching it to `false` (first
+  hunk of the patch in section 7) is correct for unaligned cells but did not
+  make the modem find the neighbour.
+
+**Workaround: force the handover from the gNB console.** Type into the console
+of the gNB serving the UE:
 
 ```
-/local/repository/bin/update-attens ru1ue1 95
-/local/repository/bin/update-attens gnb2ue1 0
+ho <serving pci> <rnti> <target pci>
 ```
 
-**Likely cause (not confirmed).** The X310 and N300 run on separate internal
-clocks, so the two cells are offset in frequency and timing, and the UE cannot
-find gNB 2 as a same-frequency neighbour.
+For example `ho 1 4606 3` on cudu or `ho 3 4601 1` on cudu2. The RNTI is the
+second column of the metrics table and changes after every handover. The UE
+gets the handover command, searches for the target cell from scratch and
+connects. Measured: four handovers back and forth, about 150 ms each from
+`HandoverRequired` to `HandoverNotify`, 605 of 605 pings answered.
 
-**Status: open.** Test in progress: lock both radios to the external 10 MHz
-reference so the cells are aligned in frequency. Handover not yet re-run.
+Both cells must be on air at similar levels when you do this
+(`ru1ue1 5`, `gnb2ue1 0` gives about -83 and -81 dBm):
 
-Stop both gNBs, then on cudu and cudu2:
+- The target must be strong enough to be found.
+- The serving cell must not be much weaker than the other one. With the
+  serving cell 18 dB below the other, the link failed within seconds and the
+  UE reconnected from scratch on the stronger cell (`rrcReestablishmentRequest`
+  rejected, then a new `rrcSetup`). That is not a handover.
 
-```
-sudo sed -i -e "s/clock: internal/clock: external/" -e "s/sync: internal/sync: external/" /var/tmp/etc/ocudu/gnb*_inter_ho.yml
-```
+**Real fix.** PPS to both radios (ask POWDER). Not available today.
 
-The N300 has no PPS on its external input. With `sync: external` gNB 2 fails
-at startup:
+**Other things learned here.**
 
-```
-[ERROR] [RPC] Failed to capture PPS.
-Error: couldn't set sync source: ... Failed to capture PPS.
-OCUDU ERROR: Unable to create radio session.
-```
+- 60 on the gNB 1 paths does not remove the cell: PCI 1 stays at about
+  -112 dBm with 10 dB SINR even at 95, through leakage in the matrix. The UE
+  therefore never loses gNB 1 on its own.
+- `handover-gnb` runs its whole fade in under 6 seconds.
 
-So on cudu2 keep the external clock but put the time source back to internal:
+## 7. Second handover of the same UE fails: `Could not find DU for CGI`
 
-```
-sudo sed -i "s/sync: external/sync: internal/" /var/tmp/etc/ocudu/gnb2_rf_n300_inter_ho.yml
-```
+**Symptom.** The first forced handover works. Handing the same UE back fails:
+the source logs `HandoverPreparationFailure`, the target logs
+`Could not find DU for CGI=6576` (or 6592) and `Sending HandoverFailure`, the
+AMF logs `ErrorIndication`, and the UE is released and loses its session.
 
-```
-grep -n "clock:\|sync:" /var/tmp/etc/ocudu/gnb*_inter_ho.yml
-```
+**Cause.** OCUDU bug at commit `050a2bb72e`. The target gNB does not store the
+serving GUAMI for a UE that arrives by NG handover (it is only set on initial
+context setup). The next `HandoverRequired` for that UE carries an empty PLMN
+in the target cell ID, so the target cannot match it to its cell.
 
-gNB 2 starts with `clock: external`, `sync: internal`. A clean start is not
-proof the N300 locked to a 10 MHz signal; the neighbour report below is.
-
-Start both gNBs, put ue1 back on gNB 1, then hand over:
-
-```
-/local/repository/bin/update-attens ru1ue1 0
-/local/repository/bin/update-attens gnb2ue1 95
-```
-
-```
-/local/repository/bin/handover-gnb ue1 gnb2
-```
-
-Success shows first as PCI 3 appearing in ue1's measurement reports on cudu:
+**Fix.** One added line in
+`lib/ngap/procedures/ngap_handover_resource_allocation_procedure.cpp`:
+`ue_ctxt.serving_guami = request.guami;`. It is the second hunk of
+[etc/ocudu-patches/050a2bb72e-inter-gnb-handover.patch](../etc/ocudu-patches/050a2bb72e-inter-gnb-handover.patch).
+On cudu and cudu2, with the gNB stopped:
 
 ```
-grep -n "measResultNeighCells" /tmp/gnb.log | tail
+git -C /var/tmp/ocudu apply /local/repository/etc/ocudu-patches/050a2bb72e-inter-gnb-handover.patch
 ```
 
-To revert:
+```
+make -C /var/tmp/ocudu/build -j 48 gnb
+```
 
-```
-sudo sed -i -e "s/clock: external/clock: internal/" -e "s/sync: external/sync: internal/" /var/tmp/etc/ocudu/gnb*_inter_ho.yml
-```
+`bin/deploy-ocudu.sh` does not apply this patch; a fresh experiment needs the
+two commands above.
 
 ## Restarting the core
 
@@ -256,12 +276,14 @@ sudo systemctl restart 'open5gs-*'
 
 ## State of the nodes versus the repo
 
-Changes made by hand on the nodes that a fresh experiment will not have:
+Changes made by hand on the nodes that a fresh experiment will not have.
+`bin/start-inter-gnb` applies the first three on every start.
 
-| Change | cudu | cudu2 | In repo config |
-|--------|------|-------|----------------|
-| `ssb_arfcn: 632256` | yes | yes | no (placeholder) |
-| `ssb_period: 5` on the cell | yes (duplicated) | yes | yes |
-| `srate: 23.04`, no `lo_offset` | yes | n/a | no |
-| `clock: external` | yes (as instructed, not re-checked) | yes | no |
-| `sync: external` | yes (as instructed, not re-checked) | no (no PPS) | no |
+| Change | cudu | cudu2 | In repo |
+|--------|------|-------|---------|
+| `ssb_arfcn: 632256` | yes | yes | placeholder in config; set by `start-inter-gnb` |
+| `ssb_period: 5` on the cell | yes | yes | yes |
+| `srate: 23.04`, no `lo_offset` | yes | n/a | 92.16 in config; set by `start-inter-gnb` |
+| `clock: external` | yes | yes | no; `start-inter-gnb -c external` |
+| `sync: external` | yes | no (no PPS) | no |
+| OCUDU patch (section 7), rebuilt `gnb` | yes | yes | patch file only, not applied at deploy |

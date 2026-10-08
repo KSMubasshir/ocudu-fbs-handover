@@ -171,14 +171,18 @@ sudo numactl --membind 0 --cpubind 0 \
 sudo /var/tmp/ocudu/build/apps/gnb/gnb -c /var/tmp/etc/ocudu/gnb2_rf_n300_inter_ho.yml
 ```
 
-Attach `ue1` as above (it starts on gNB 1, PCI 1; the paths to gNB 2 start at maximum attenuation), start the ping, and move it across:
+Attach `ue1` as above (it starts on gNB 1, PCI 1; the paths to gNB 2 start at maximum attenuation) and start the ping. The X310 and N300 are not time aligned (neither receives a PPS), so the UE does not report the other gNB's cell and fading the attenuators does not trigger a handover. Put both cells on air at similar levels and force the handover from the console of the gNB serving the UE, with the RNTI from its metrics table:
 
 ```
 # on the cudu node
-/local/repository/bin/handover-gnb ue1 gnb2
+/local/repository/bin/update-attens ru1ue1 5
+/local/repository/bin/update-attens gnb2ue1 0
+
+# in the gNB console on cudu
+ho 1 <rnti> 3
 ```
 
-The UE's row disappears from the metrics table on `cudu` and appears with PCI 3 on `cudu2`; `/local/repository/bin/handover-gnb ue1 gnb1` moves it back.
+The UE's row disappears from the metrics table on `cudu` and appears with PCI 3 on `cudu2`; `ho 3 <rnti> 1` in the gNB console on `cudu2` moves it back. Handing the same UE over a second time needs the OCUDU patch in `etc/ocudu-patches/`; see `note/troubleshooting.md`.
 
 Notes: the N300 gains in `gnb2_rf_n300_inter_ho.yml` are starting values and may need adjusting so both cells arrive at the UE at similar levels. The two radios run on their internal clocks, so the cells are not time aligned. `bin/update-attens gnb2ue1|gnb2ue2` assumes the first eight N300 paths belong to `ue1` and the rest to `ue2`; check against `bin/atten -l`.
 

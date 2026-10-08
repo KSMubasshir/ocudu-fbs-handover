@@ -98,7 +98,25 @@ The PCI in the gNB metrics table changes 1 -> 2 and back.
 
 Stop the gNB from section 2 first (Ctrl-C).
 
-### cudu AND cudu2: fill in the SSB ARFCN (once)
+### cudu AND cudu2: start the gNB
+
+Same command on both nodes; it picks gNB 1 on `cudu` and gNB 2 on `cudu2`,
+applies the config edits listed under "By hand" below, and starts the gNB in
+the foreground.
+
+```
+/local/repository/bin/start-inter-gnb
+```
+
+Options: `-a <ssb_arfcn>` if the carrier changed (default 632256),
+`-c external` or `-c internal` to set the radio's reference clock (left as is
+without it).
+
+Then continue at "ue1: attach and ping".
+
+### By hand
+
+#### cudu AND cudu2: fill in the SSB ARFCN (once)
 
 Set `ARFCN` to the number noted in section 2 (digits only), then run the sed.
 It rewrites the whole `ssb_arfcn:` line, so it is safe to re-run.
@@ -115,7 +133,7 @@ sudo sed -i "s/ssb_arfcn: .*/ssb_arfcn: $ARFCN/" /var/tmp/etc/ocudu/gnb*_inter_h
 grep -n ssb_arfcn /var/tmp/etc/ocudu/gnb*_inter_ho.yml
 ```
 
-### cudu AND cudu2: 5 ms SSB period (once, only on nodes deployed before the repo fix)
+#### cudu AND cudu2: 5 ms SSB period (once, only on nodes deployed before the repo fix)
 
 Without this the gNB starts but rejects its own cell (`F1 Setup Failure` in
 `/tmp/gnb.log`) and no UE can attach.
@@ -134,14 +152,14 @@ After starting a gNB, confirm the cell was accepted (no output means it was):
 grep -n "F1 Setup Failure\|Invalid cell measurement" /tmp/gnb.log
 ```
 
-### cudu: start gNB 1
+#### cudu: start gNB 1
 
 ```
 sudo numactl --membind 0 --cpubind 0 \
   /var/tmp/ocudu/build/apps/gnb/gnb -c /var/tmp/etc/ocudu/gnb1_rf_x310_inter_ho.yml
 ```
 
-### cudu2: start gNB 2
+#### cudu2: start gNB 2
 
 ```
 sudo /var/tmp/ocudu/build/apps/gnb/gnb -c /var/tmp/etc/ocudu/gnb2_rf_n300_inter_ho.yml
@@ -151,17 +169,53 @@ sudo /var/tmp/ocudu/build/apps/gnb/gnb -c /var/tmp/etc/ocudu/gnb2_rf_n300_inter_
 
 Same as section 2 (`quectel-CM`, `module-on.sh`, `ping 10.45.0.1`).
 
-### cudu: hand over (second session)
+### cudu: both cells on air at similar levels
 
 ```
-/local/repository/bin/handover-gnb ue1 gnb2
+/local/repository/bin/update-attens ru1ue1 5
+/local/repository/bin/update-attens gnb2ue1 0
+```
+
+### Hand over: type into the console of the gNB serving the UE
+
+The cells are not time-aligned, so the UE never reports the other cell and
+`handover-gnb` cannot trigger a handover (troubleshooting.md section 6). Force
+it instead. `<rnti>` is the second column of the metrics table; it changes
+after every handover.
+
+```
+# cudu console: gNB 1 -> gNB 2
+ho 1 <rnti> 3
 ```
 
 ```
-/local/repository/bin/handover-gnb ue1 gnb1
+# cudu2 console: gNB 2 -> gNB 1
+ho 3 <rnti> 1
 ```
 
-The UE row leaves the table on `cudu` and appears with PCI 3 on `cudu2`.
+The UE row leaves the table on one node and appears on the other with a new
+RNTI. Needs the OCUDU patch (troubleshooting.md section 7), or the second
+handover of a UE fails.
+
+```
+grep -a "NGAP.*Handover\|Could not find" /tmp/gnb.log
+```
+
+### gNB in tmux (so the console survives the SSH session)
+
+```
+tmux new-session -d -s gnb /local/repository/bin/start-inter-gnb
+```
+
+```
+tmux attach -t gnb
+```
+
+Detach with Ctrl-b d. To send a console command without attaching:
+
+```
+tmux send-keys -t gnb "ho 1 <rnti> 3" Enter
+```
 
 ## Attenuators (cudu or cudu2, never the NUCs)
 
@@ -277,6 +331,40 @@ cd /local/repository && uv run bin/rrm-policy-set.py -h
 ```
 tail -f /tmp/gnb.log
 ```
+
+## Measurement reports and NGAP traces
+
+The full run, step by step with expected output, is in
+[handover-and-traces.md](handover-and-traces.md).
+
+### cn5g: NGAP between the AMF and both gNBs
+
+Start before the handover, Ctrl-C to stop. One capture covers both gNBs and
+needs no gNB restart.
+
+```
+/local/repository/bin/ngap-capture /tmp/ngap.pcap
+```
+
+```
+tshark -r /tmp/ngap.pcap -Y ngap
+```
+
+### cudu / cudu2: UE measurement reports from the gNB log
+
+One CSV row per reported cell (serving, and neighbour if any), in dBm / dB.
+Run it on each gNB node; a UE's reports are in the log of the gNB serving it.
+
+```
+/local/repository/bin/meas-reports.py -o /tmp/meas.csv
+```
+
+```
+/local/repository/bin/meas-reports.py --jsonl > /tmp/meas.jsonl
+```
+
+`/tmp/gnb.log` is overwritten when the gNB starts and is buffered, so collect
+after stopping the gNB (or copy the log away first) to get every report.
 
 ## Traffic
 

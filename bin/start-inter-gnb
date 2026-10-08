@@ -1,0 +1,91 @@
+#!/bin/bash
+GNB=/var/tmp/ocudu/build/apps/gnb/gnb
+CFGDIR=/var/tmp/etc/ocudu
+# dl_ssb_arfcn the gNB prints for dl_arfcn 632628, band 78, 20 MHz, 30 kHz SCS
+SSB_ARFCN=632256
+CLOCK=""
+
+usage() {
+    cat <<EOF
+usage:
+    start-inter-gnb -h
+        show this help message
+    start-inter-gnb [-a <ssb_arfcn>] [-c internal|external]
+        prepare the inter-gNB handover config of this node and start the gNB
+        in the foreground (gNB 1 on cudu, gNB 2 on cudu2; picked from the
+        node's 192.168.1.x address)
+        -a  SSB ARFCN of the neighbour cell (default $SSB_ARFCN)
+        -c  reference clock of the radio; without it the config is left as is
+            external: 10 MHz reference in (PPS too on the X310; the N300 has
+            no PPS input, so its time source stays internal)
+EOF
+}
+
+while getopts "ha:c:" opt; do
+    case $opt in
+        h) usage; exit 0 ;;
+        a) SSB_ARFCN=$OPTARG ;;
+        c) CLOCK=$OPTARG ;;
+        *) usage; exit 1 ;;
+    esac
+done
+
+if ! [[ $SSB_ARFCN =~ ^[0-9]+$ ]]; then
+    echo "invalid ssb_arfcn"; usage; exit 1
+fi
+
+if [ -n "$CLOCK" ] && [ "$CLOCK" != "internal" ] && [ "$CLOCK" != "external" ]; then
+    echo "invalid clock"; usage; exit 1
+fi
+
+LANIP=$(ip -4 -o addr show | awk '{print $4}' | grep '^192\.168\.1\.' | cut -d/ -f1)
+case $LANIP in
+    192.168.1.2)
+        NAME="gNB 1 (X310)"
+        CFG=$CFGDIR/gnb1_rf_x310_inter_ho.yml
+        SYNC=$CLOCK
+        RUN="numactl --membind 0 --cpubind 0"
+        ;;
+    192.168.1.3)
+        NAME="gNB 2 (N300)"
+        CFG=$CFGDIR/gnb2_rf_n300_inter_ho.yml
+        SYNC=internal
+        RUN=""
+        ;;
+    *)
+        echo "this node is neither cudu (192.168.1.2) nor cudu2 (192.168.1.3)"; exit 1
+        ;;
+esac
+
+if [ ! -x $GNB ] || [ ! -f $CFG ]; then
+    echo "$GNB or $CFG is missing; has the startup script finished?"; exit 1
+fi
+
+if pgrep -x gnb > /dev/null; then
+    echo "a gnb process is already running on this node; stop it first"; exit 1
+fi
+
+# The seds below can all be re-run on a config that already has the change.
+sudo sed -i "s/ssb_arfcn: .*/ssb_arfcn: $SSB_ARFCN/" $CFG
+
+# The cell must use the 5 ms SSB period declared for the neighbour, or the gNB
+# rejects its own cell (F1 Setup Failure). Configs copied before the repo fix
+# lack it.
+if ! grep -q "^  ssb:" $CFG; then
+    sudo sed -i -e 's/^  pci: \([0-9]*\)$/  pci: \1\n  ssb:\n    ssb_period: 5/' $CFG
+fi
+
+# One 20 MHz cell does not need the two-cell sample rate, and the host cannot
+# keep up with the X310 at 92.16 (Late/Underflow/Overflow). The 45 MHz LO
+# offset does not fit in 23.04.
+sudo sed -i -e "s/srate: 92.16/srate: 23.04/" -e "/lo_offset: 45/d" $CFG
+
+if [ -n "$CLOCK" ]; then
+    sudo sed -i -e "s/^  clock: .*/  clock: $CLOCK/" -e "s/^  sync: .*/  sync: $SYNC/" $CFG
+fi
+
+/local/repository/bin/tune-sdr-iface.sh > /dev/null
+
+echo "starting $NAME with $CFG"
+grep -n "ssb_arfcn:\|srate:\|clock:\|sync:" $CFG
+exec sudo $RUN $GNB -c $CFG
