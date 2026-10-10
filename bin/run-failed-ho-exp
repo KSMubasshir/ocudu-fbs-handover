@@ -1,15 +1,16 @@
 #!/bin/bash
 # Failed-handover experiment from your own machine. gNB 1 (cn5g, home 999/99)
-# carries a phantom neighbour (etc/oai/neighbour-config-phantom.conf) that
-# advertises gNB 2's carrier/PCI under a fake target identity core 1 cannot
-# resolve. gNB 2 (cn5g2, foreign 001/01) is a real but unrelated network.
+# carries a measure-only neighbour config (etc/oai/neighbour-config-measonly.conf):
+# the UE is told to measure gNB 2's carrier so gNB 2 is a handover candidate,
+# but gNB 1 holds NO neighbour relation for gNB 2's PCI (3). gNB 2 (cn5g2,
+# foreign 001/01) is a real but unrelated network.
 #
 # Restart both gNBs, attach ue1 to gNB 1, bring gNB 2 up on its own carrier,
-# then force gNB 1 to start a handover toward the phantom target (standing in
-# for the UE's request: the Quectel does not spontaneously report a neighbour
-# on this testbed). Capture core 1's NGAP, the AMF log, gNB 1's log and the UE
-# serving cell, and show the HandoverRequired being rejected and the UE
-# staying on gNB 1.
+# then force gNB 1 toward gNB 2's PCI (standing in for the UE's request: the
+# Quectel does not spontaneously report a neighbour on this testbed). gNB 1
+# cannot resolve the unknown PCI to a target, so no HandoverRequired is sent
+# and the UE stays on gNB 1. Capture core 1's NGAP (expected empty of
+# handover), the AMF log, gNB 1's log and the UE serving cell.
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 HOSTS_FILE=$REPO/hosts.env
 REMOTE_BIN=/local/repository/bin
@@ -101,7 +102,7 @@ push $CN5G "$REPO/bin/ngap-capture" || die "copy to $CN5G failed"
 for host in $CUDU $CUDU2; do
     push $host "$REPO/bin/start-oai-gnb" || die "copy to $host failed"
 done
-push_cfg $CUDU "$REPO/etc/oai/gnb1_x310_core1.conf" "$REPO/etc/oai/neighbour-config-phantom.conf" || die "config copy to $CUDU failed"
+push_cfg $CUDU "$REPO/etc/oai/gnb1_x310_core1.conf" "$REPO/etc/oai/neighbour-config-measonly.conf" || die "config copy to $CUDU failed"
 push_cfg $CUDU2 "$REPO/etc/oai/gnb2_n300_core2.conf" || die "config copy to $CUDU2 failed"
 
 step "Starting gNB 1 (-> core 1) on cudu and gNB 2 (-> core 2) on cudu2"
@@ -142,7 +143,7 @@ $REMOTE_BIN/update-attens gnb2ue1 0
 EOF
 sleep 5
 
-step "Capturing core 1 NGAP and forcing the handover toward the phantom target"
+step "Capturing core 1 NGAP and forcing a handover toward gNB 2's unknown PCI"
 on $CN5G <<EOF || die "could not start the NGAP capture"
 tmux kill-session -t ngap 2> /dev/null
 sudo pkill -INT -x tcpdump
@@ -194,9 +195,10 @@ EOF
 done
 
 step "Summary"
-echo "gNB 1 HandoverRequired: $(grep -c "HandoverRequired" "$OUTDIR/core1-ngap.txt" 2> /dev/null)"
-echo "core 1 rejection:"
-grep -iE "cannot find target|ErrorIndication|HandoverPreparationFailure" "$OUTDIR/core1-ngap.txt" "$OUTDIR/core1-amf.log" 2> /dev/null | sed 's/^/    /'
+echo "gNB 1 refused the handover (unknown PCI, no relation):"
+grep -aE "could not find neighbour cell with PCI|no such neighbour in configuration" "$OUTDIR/gnb1.log" 2> /dev/null | sed 's/\x1b\[[0-9;]*m//g; s/^/    /' | tail -3
+echo "core 1 NGAP handover messages (expected none):"
+echo "    HandoverRequired seen: $(grep -c "HandoverRequired" "$OUTDIR/core1-ngap.txt" 2> /dev/null)"
 echo "ue1 serving cell after the attempt (expect 999,99 PCI 1):"
 sed 's/^/    /' "$OUTDIR/ue1-serving-cell.txt" 2> /dev/null
 echo "ping: $(grep "packets transmitted" "$OUTDIR/ping-ho.out" 2> /dev/null || echo "see gnb1.log")"
