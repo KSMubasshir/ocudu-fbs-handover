@@ -8,6 +8,28 @@ networks share nothing; there is no handover. The Quectel SIMs are homed on
 Hostnames change on every POWDER instantiation; take them from the portal.
 The login shell on the nodes is `tcsh`.
 
+## Whole run from your machine
+
+`bin/run-second-core-exp` does sections 1 to 8 over SSH and copies the
+results to `traces/second-core-<date>-<time>/`. Add the new core to
+`hosts.env` first:
+
+```
+CN5G2=<cn5g2 hostname>
+```
+
+```
+bin/run-second-core-exp            # 30 s per phase, with scan and fade
+bin/run-second-core-exp -d 60 -S   # 60 s per phase, no modem scan
+```
+
+Phases: ue1 attached on gNB 1 alone; both cells at similar levels (plus an
+`AT+QSCAN` network scan); gNB 1 faded out with only the foreign cell left;
+gNB 1 back. `timeline.txt` has the UTC time of every phase change. Fetched:
+both cores' NGAP pcap, NGAP text and AMF/SMF/UPF log, both gNB logs and
+sampled measurement reports, ue1's serving cell once a second, the ping and
+the scan.
+
 ## SSH
 
 ```

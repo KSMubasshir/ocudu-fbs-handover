@@ -1,0 +1,342 @@
+#!/bin/bash
+# Run the second-core experiment from your own machine: gNB 1 on core 1
+# (cn5g, PLMN 999/99) and gNB 2 on its own core 2 (cn5g2, foreign PLMN 001/01).
+# Restart both gNBs, attach ue1 to gNB 1, then go through three phases while
+# logging the UE's serving cell, its measurement reports and both cores' NGAP:
+#   1. both cells on air at similar levels, with a modem network scan
+#   2. gNB 1 faded out (does the UE move to the foreign PLMN or lose service?)
+#   3. gNB 1 restored (does the UE come back to its home network?)
+# and copy the captures, logs and scan here.
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+HOSTS_FILE=$REPO/hosts.env
+REMOTE_BIN=/local/repository/bin
+OAI_BUILD=/var/tmp/oai/cmake_targets/ran_build/build
+DWELL=30
+SCAN=1
+FADE=1
+OUTDIR=""
+
+usage() {
+    cat <<EOF
+usage:
+    run-second-core-exp -h
+        show this help message
+    run-second-core-exp [-d <seconds>] [-S] [-F] [-o <dir>] [-f <hosts file>]
+        -d  seconds spent in each phase (default $DWELL)
+        -S  skip the modem network scan (AT+QSCAN takes a minute or two)
+        -F  skip fading gNB 1 out and back in (phases 2 and 3)
+        -o  local output directory (default traces/second-core-<date>-<time>
+            in the repo)
+        -f  file that sets SSH_USER, CN5G, CN5G2, CUDU, CUDU2 and UE1 (default
+            hosts.env in the repo); the hostnames change with every POWDER
+            experiment
+
+    Both gNBs are restarted at the beginning and stopped at the end, so that
+    their logs hold exactly this run. OAI must already be built on cudu and
+    cudu2 (/var/tmp/oai-setup-complete) and Open5GS installed on cn5g and
+    cn5g2 (/var/tmp/open5gs-setup-complete).
+EOF
+}
+
+while getopts "hd:SFo:f:" opt; do
+    case $opt in
+        h) usage; exit 0 ;;
+        d) DWELL=$OPTARG ;;
+        S) SCAN=0 ;;
+        F) FADE=0 ;;
+        o) OUTDIR=$OPTARG ;;
+        f) HOSTS_FILE=$OPTARG ;;
+        *) usage; exit 1 ;;
+    esac
+done
+
+if ! [[ $DWELL =~ ^[1-9][0-9]*$ ]]; then
+    echo "invalid -d"; usage; exit 1
+fi
+
+if [ ! -f "$HOSTS_FILE" ]; then
+    echo "$HOSTS_FILE not found"; usage; exit 1
+fi
+source "$HOSTS_FILE"
+for var in SSH_USER CN5G CN5G2 CUDU CUDU2 UE1; do
+    if [ -z "${!var}" ]; then
+        echo "$var is not set in $HOSTS_FILE"; exit 1
+    fi
+done
+
+OUTDIR=${OUTDIR:-$REPO/traces/second-core-$(date +%Y-%m-%d-%H%M%S)}
+mkdir -p "$OUTDIR" || { echo "cannot create $OUTDIR"; exit 1; }
+TIMELINE=$OUTDIR/timeline.txt
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15"
+
+# The login shell on the nodes is csh, so every remote command is fed to bash
+# on stdin: on <host> <<'EOF' ... EOF
+on() {
+    ssh $SSH_OPTS $SSH_USER@$1 'bash -s'
+}
+
+step() {
+    echo
+    echo "== $*"
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+# mark <text>: note an experiment event with a UTC timestamp, on screen and in
+# timeline.txt, to line the phases up with the logs afterwards.
+mark() {
+    echo "$(date -u +%FT%T.%3NZ) $*" | tee -a "$TIMELINE"
+}
+
+# push <host> <file>...: install scripts from this checkout in the node's
+# repository, whatever branch and file ownership it has there.
+push() {
+    local host=$1
+    shift
+    ssh $SSH_OPTS $SSH_USER@$host 'mkdir -p /tmp/oai-exp-bin' || return 1
+    scp -q $SSH_OPTS "$@" $SSH_USER@$host:/tmp/oai-exp-bin/ || return 1
+    ssh $SSH_OPTS $SSH_USER@$host "sudo install -m 775 /tmp/oai-exp-bin/* $REMOTE_BIN/"
+}
+
+# check_core <host> <mcc> <mnc>: Open5GS is installed, its AMF is running and
+# it is configured for the expected PLMN.
+check_core() {
+    on $1 <<EOF
+[ -f /var/tmp/open5gs-setup-complete ] || { echo "\$(hostname -s): Open5GS is not installed (bin/deploy-open5gs.sh)"; exit 1; }
+systemctl is-active --quiet open5gs-amfd || { echo "\$(hostname -s): open5gs-amfd is not running"; exit 1; }
+grep -q "mcc: $2" /etc/open5gs/amf.yaml && grep -q "mnc: $3" /etc/open5gs/amf.yaml \
+    || { echo "\$(hostname -s): amf.yaml is not configured for PLMN $2/$3"; exit 1; }
+echo "\$(hostname -s): Open5GS up, PLMN $2/$3"
+EOF
+}
+
+# start_gnb <host>: (re)start the node's gNB in a tmux session named gnb. Its
+# output goes to /tmp/gnb.log.
+start_gnb() {
+    on $1 <<EOF
+set -e
+[ -f /var/tmp/oai-setup-complete ] || { echo "\$(hostname -s): OAI is not built (bin/deploy-oai.sh)"; exit 1; }
+sudo pkill -INT -x nr-softmodem || true
+for i in \$(seq 30); do pgrep -x nr-softmodem > /dev/null || break; sleep 1; done
+sudo pkill -KILL -x nr-softmodem || true
+tmux kill-session -t gnb 2> /dev/null || true
+tmux kill-session -t meas 2> /dev/null || true
+sudo rm -f /tmp/gnb.log /tmp/meas.csv $OAI_BUILD/nrRRC_stats.log
+tmux new-session -d -s gnb -x 200 -y 50 $REMOTE_BIN/start-oai-gnb
+EOF
+}
+
+wait_gnb() {
+    on $1 <<'EOF'
+for i in $(seq 60); do
+    if grep -aq "Received NGSetupResponse" /tmp/gnb.log 2> /dev/null && grep -aq "RF started" /tmp/gnb.log; then
+        echo "$(hostname -s): gNB started"; exit 0
+    fi
+    pgrep -x nr-softmodem > /dev/null || [ $i -lt 5 ] || break
+    sleep 2
+done
+echo "$(hostname -s): gNB did not start:"; tail -n 15 /tmp/gnb.log
+exit 1
+EOF
+}
+
+# attens <group> <value> ...: set attenuator groups (run on cudu).
+attens() {
+    local cmds=""
+    while [ $# -ge 2 ]; do
+        cmds+="$REMOTE_BIN/update-attens $1 $2 > /dev/null"$'\n'
+        shift 2
+    done
+    on $CUDU <<< "$cmds"
+}
+
+# cell_log start|stop: poll the modem's serving cell (AT+QENG) once a second
+# into /tmp/ue-cell.out on ue1. It must be stopped while anything else (the
+# network scan, airplane mode) uses the modem's AT port.
+cell_log() {
+    if [ "$1" = start ]; then
+        on $UE1 <<'EOF'
+cat > /tmp/ue-cell-log.sh <<'EOS'
+#!/bin/bash
+while true; do
+    CELL=$(sudo sh -c "chat -t 2 -sv '' AT OK 'AT+QENG=\"servingcell\"' OK < /dev/ttyUSB2 > /dev/ttyUSB2" 2>&1 | grep -a "^+QENG" | tr -d '\r')
+    echo "$(date +%s.%3N) ${CELL:-no reply}"
+    sleep 1
+done
+EOS
+chmod +x /tmp/ue-cell-log.sh
+tmux kill-session -t cell 2> /dev/null
+tmux new-session -d -s cell "bash -c '/tmp/ue-cell-log.sh >> /tmp/ue-cell.out 2>&1'"
+EOF
+    else
+        on $UE1 <<'EOF'
+tmux kill-session -t cell 2> /dev/null
+sleep 3
+true
+EOF
+    fi
+}
+
+step "Checking the nodes and copying the scripts"
+for host in $CN5G $CN5G2 $CUDU $CUDU2 $UE1; do
+    ssh $SSH_OPTS $SSH_USER@$host true || die "cannot reach $host; update $HOSTS_FILE"
+done
+check_core $CN5G 999 99 || die "core 1 on $CN5G is not ready"
+check_core $CN5G2 001 01 || die "core 2 on $CN5G2 is not ready"
+for host in $CN5G $CN5G2; do
+    push $host "$REPO/bin/ngap-capture" || die "copy to $host failed"
+done
+for host in $CUDU $CUDU2; do
+    push $host "$REPO/bin/start-oai-gnb" "$REPO/bin/oai-meas-log.py" || die "copy to $host failed"
+done
+START=$(on $CN5G <<< 'date +%s')
+START2=$(on $CN5G2 <<< 'date +%s')
+
+step "Starting the NGAP captures on cn5g and cn5g2"
+for host in $CN5G $CN5G2; do
+    on $host <<EOF || die "could not start the NGAP capture on $host"
+tmux kill-session -t ngap 2> /dev/null
+sudo pkill -INT -x tcpdump
+sudo rm -f /tmp/ngap.pcap
+tmux new-session -d -s ngap '$REMOTE_BIN/ngap-capture /tmp/ngap.pcap'
+sleep 2
+pgrep -x tcpdump > /dev/null
+EOF
+done
+
+step "Starting gNB 1 (-> core 1) on cudu and gNB 2 (-> core 2) on cudu2"
+mark "start gNBs"
+start_gnb $CUDU & pid1=$!
+start_gnb $CUDU2 & pid2=$!
+wait $pid1 || die "could not start the gNB on cudu"
+wait $pid2 || die "could not start the gNB on cudu2"
+wait_gnb $CUDU || die "gNB 1 is not running"
+wait_gnb $CUDU2 || die "gNB 2 is not running"
+for host in $CUDU $CUDU2; do
+    on $host <<EOF || die "could not start the measurement report log on $host"
+tmux new-session -d -s meas '$REMOTE_BIN/oai-meas-log.py -o /tmp/meas.csv'
+EOF
+done
+
+step "Attaching ue1 to gNB 1 (home PLMN 999/99)"
+mark "attens: gNB 1 only (ru1ue1 0, gnb2ue1 95)"
+attens ru1ue1 0 gnb2ue1 95 || die "could not set the attenuators"
+on $UE1 <<EOF || die "ue1 did not get a data connection"
+tmux kill-session -t cell 2> /dev/null
+tmux kill-session -t ping 2> /dev/null
+rm -f /tmp/ue-cell.out /tmp/ping-ue1.out /tmp/ue-scan.out
+pgrep -x quectel-CM > /dev/null || { tmux kill-session -t cm 2> /dev/null; tmux new-session -d -s cm 'sudo quectel-CM -s internet -4'; }
+$REMOTE_BIN/module-airplane.sh > /dev/null 2>&1
+sleep 3
+$REMOTE_BIN/module-on.sh > /dev/null 2>&1
+for i in \$(seq 45); do
+    ping -c 1 -W 1 10.45.0.1 > /dev/null 2>&1 && { echo "ue1 reaches 10.45.0.1"; exit 0; }
+    sleep 2
+done
+exit 1
+EOF
+mark "ue1 attached"
+on $UE1 <<'EOF' || die "could not start the ping"
+tmux new-session -d -s ping "bash -c 'ping -D -O -i 0.2 10.45.0.1 > /tmp/ping-ue1.out 2>&1'"
+EOF
+cell_log start || die "could not start the serving cell log"
+sleep $DWELL
+
+step "Phase 1: both cells on air at similar levels"
+mark "phase 1: both cells (ru1ue1 5, gnb2ue1 0)"
+attens ru1ue1 5 gnb2ue1 0 || die "could not set the attenuators"
+sleep $DWELL
+if [ $SCAN -eq 1 ]; then
+    mark "network scan start"
+    cell_log stop
+    on $UE1 <<'EOF' || echo "the network scan failed"
+sudo sh -c "chat -t 180 -sv '' AT OK 'AT+QSCAN=2' OK < /dev/ttyUSB2 > /dev/ttyUSB2" 2>&1 | grep -a "^+QSCAN" | tr -d '\r' > /tmp/ue-scan.out
+cat /tmp/ue-scan.out
+EOF
+    mark "network scan end"
+    cell_log start
+fi
+
+if [ $FADE -eq 1 ]; then
+    step "Phase 2: gNB 1 faded out, gNB 2 (foreign PLMN) on"
+    mark "phase 2: gNB 1 out (ru1ue1 95, gnb2ue1 0)"
+    attens ru1ue1 95 || die "could not set the attenuators"
+    sleep $DWELL
+
+    step "Phase 3: gNB 1 back"
+    mark "phase 3: gNB 1 back (ru1ue1 5, gnb2ue1 0)"
+    attens ru1ue1 5 || die "could not set the attenuators"
+    sleep $DWELL
+fi
+
+step "Stopping the ping, the logs, the captures and both gNBs"
+mark "stop"
+cell_log stop
+on $UE1 <<'EOF'
+tmux send-keys -t ping C-c
+sleep 1
+tmux kill-session -t ping 2> /dev/null
+true
+EOF
+for host in $CN5G $CN5G2; do
+    [ $host = $CN5G ] && since=$START || since=$START2
+    on $host <<EOF
+tmux send-keys -t ngap C-c
+sleep 1
+sudo pkill -INT -x tcpdump
+sudo journalctl -u open5gs-amfd -u open5gs-smfd -u open5gs-upfd --since @$since --no-pager -o short-precise | sed 's/\x1b\[[0-9;]*m//g' > /tmp/core.log
+tshark -r /tmp/ngap.pcap -Y ngap -t ad 2> /dev/null > /tmp/ngap.txt
+true
+EOF
+done
+for host in $CUDU $CUDU2; do
+    on $host <<EOF
+tmux send-keys -t meas C-c
+cp $OAI_BUILD/nrRRC_stats.log /tmp/nrRRC_stats.last 2> /dev/null
+sudo pkill -INT -x nr-softmodem
+for i in \$(seq 30); do pgrep -x nr-softmodem > /dev/null || break; sleep 1; done
+sudo pkill -KILL -x nr-softmodem
+tmux kill-session -t meas 2> /dev/null
+true
+EOF
+done
+
+step "Copying the results to $OUTDIR"
+fetch() {
+    scp -q -C $SSH_OPTS $SSH_USER@$1:$2 "$OUTDIR/$3" || echo "could not fetch $2 from $1"
+}
+fetch $CN5G /tmp/ngap.pcap core1-ngap.pcap
+fetch $CN5G /tmp/ngap.txt core1-ngap.txt
+fetch $CN5G /tmp/core.log core1.log
+fetch $CN5G2 /tmp/ngap.pcap core2-ngap.pcap
+fetch $CN5G2 /tmp/ngap.txt core2-ngap.txt
+fetch $CN5G2 /tmp/core.log core2.log
+fetch $CUDU /tmp/gnb.log gnb1.log
+fetch $CUDU2 /tmp/gnb.log gnb2.log
+fetch $CUDU /tmp/meas.csv meas-gnb1.csv
+fetch $CUDU2 /tmp/meas.csv meas-gnb2.csv
+fetch $CUDU /tmp/nrRRC_stats.last gnb1-nrRRC_stats.log
+fetch $CUDU2 /tmp/nrRRC_stats.last gnb2-nrRRC_stats.log
+fetch $UE1 /tmp/ue-cell.out ue1-serving-cell.txt
+fetch $UE1 /tmp/ping-ue1.out ping-ue1.txt
+[ $SCAN -eq 1 ] && fetch $UE1 /tmp/ue-scan.out ue1-scan.txt
+ls -l "$OUTDIR"
+
+step "Summary"
+for n in 1 2; do
+    f="$OUTDIR/core$n.log"
+    echo "core $n: gNBs accepted on N2: $(grep -o "gNB-N2 accepted\[[0-9.]*\]" "$f" 2> /dev/null | sort -u | tr '\n' ' ')"
+    echo "core $n: registrations completed: $(grep -c "Registration complete" "$f" 2> /dev/null)"
+done
+CELLS="$OUTDIR/ue1-serving-cell.txt"
+# QENG prints the PLMN as "<mcc>,<mnc>," after the duplex mode; anything with
+# an NR5G-SA cell that is not 999,99 is a cell of another PLMN.
+echo "ue1 serving-cell samples: $(grep -c ' 999,99,' "$CELLS" 2> /dev/null) on 999/99," \
+     "$(grep 'NR5G-SA' "$CELLS" 2> /dev/null | grep -vc ' 999,99,') on another PLMN," \
+     "$(grep -c 'no reply\|SEARCH\|LIMSRV' "$CELLS" 2> /dev/null) without service"
+echo "ping: $(grep "packets transmitted" "$OUTDIR/ping-ue1.txt" 2> /dev/null || echo "no statistics")"
+[ -f "$OUTDIR/ue1-scan.txt" ] && echo "network scan: $(wc -l < "$OUTDIR/ue1-scan.txt") cell(s), see ue1-scan.txt"
+echo "phases: see timeline.txt"

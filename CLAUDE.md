@@ -53,5 +53,6 @@ The OCUDU configs are in [etc/ocudu/](etc/ocudu/), their run sheet is [note/comm
 | [bin/handover-gnb](bin/handover-gnb) | cudu, cudu2 | Fade a UE between gNB 1 and gNB 2 (no handover here, just signal levels) |
 | [bin/ngap-capture](bin/ngap-capture) | cn5g, cn5g2 | Capture that core's NGAP (SCTP 38412) to a pcap |
 | [bin/oai-meas-log.py](bin/oai-meas-log.py) | cudu, cudu2 | Sample the UE measurement reports from OAI's `nrRRC_stats.log` as CSV (OAI does not log them) |
+| [bin/run-second-core-exp](bin/run-second-core-exp) | your machine | Whole run over SSH (hosts in `hosts.env`, which needs `CN5G2` too): restart both gNBs, attach ue1 to gNB 1, both cells on air + modem scan, fade gNB 1 out and back; results land in `traces/second-core-<date>-<time>` |
 
 Run attenuator commands on the server nodes, not the NUCs. The OCUDU-only scripts (`deploy-ocudu.sh`, `start-inter-gnb`, `handover`, `meas-reports.py`, `run-inter-gnb-exp`, ...) are unused on this branch. The N2 handover helper (`n2-handover`) and whole-run script (`run-oai-n2-exp`) exist only on the `oai-n2-handover` branch, since this variant has no handover.
