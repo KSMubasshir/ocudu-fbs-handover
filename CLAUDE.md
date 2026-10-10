@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a **POWDER testbed profile** for 5G handover experiments on the conducted RF attenuator matrix. It is based on `https://gitlab.flux.utah.edu/dmaas/srs-rf-matrix`, with the N300 node turned into a second, separate gNB for inter-gNB handover. There is no O-RAN RIC or shared VLAN.
 
-On this branch (`oai-n2-handover`) both gNBs are **OpenAirInterface (OAI)** gNBs and the profile follows the N2 handover section of OAI's [handover tutorial](https://github.com/OPENAIRINTERFACE/openairinterface5g/blob/develop/doc/handover-tutorial.md#n2-handover), with Open5GS as the core. The OCUDU scripts, configs and notes from the `optional-second-gnb` branch are still in the tree but [profile.py](profile.py) does not use them. The OAI setup has not been run on the testbed yet.
+On this branch (`oai-n2-handover`) both gNBs are **OpenAirInterface (OAI)** gNBs and the profile follows the N2 handover section of OAI's [handover tutorial](https://github.com/OPENAIRINTERFACE/openairinterface5g/blob/develop/doc/handover-tutorial.md#n2-handover), with Open5GS as the core. The OCUDU scripts, configs and notes from the `optional-second-gnb` branch are still in the tree but [profile.py](profile.py) does not use them. Tested on the testbed on 2026-10-09: forced N2 handovers work in both directions (five in a row, about 190 ms each); measurement-triggered handover does not, because the UE never reports the other cell.
 
 The entry point is [profile.py](profile.py). The previous LTE/srsRAN 4G profile is kept unchanged under [legacy-lte/](legacy-lte/) and is not used by the 5G profile.
 
@@ -34,7 +34,7 @@ RF paths in the matrix are fixed by POWDER staff; only attenuation values can be
 - `gnb1_x310_n2_ho.conf`, `gnb2_n300_n2_ho.conf` — one band 78, 106 PRB cell each on the same carrier, derived from OAI's `gnb.sa.band78.fr1.106PRB.pci0.rfsim.conf`. Apart from the header comment they differ only in gNB ID, `nr_cellid` (gNB ID * 256 + 1), PCI, PRACH root sequence, `ssb_PositionsInBurst_Bitmap`, N2/N3 address and the `RUs` section.
 - `neighbour-config.conf` — neighbour list and measurement events, `@include`d by both.
 
-`bin/start-oai-gnb` adds the radio options: `-E --continuous-tx` on the X310 (46.08 Msps from its 184.32 MHz clock), none on the N300 (61.44 Msps from 122.88 MHz). The handover is forced with `bin/n2-handover <target pci>` (telnet `ci trigger_n2_ho`); OAI also triggers it from an A3 report, but the two radios get no PPS, so the cells are not time-aligned and with OCUDU the UE never reported the other cell ([note/troubleshooting.md](note/troubleshooting.md) section 6). Keep `time_src` internal: OAI blocks waiting for a PPS otherwise.
+`bin/start-oai-gnb` adds the radio options: `-E --continuous-tx` on the X310 (46.08 Msps from its 184.32 MHz clock), none on the N300 (61.44 Msps from 122.88 MHz). The handover is forced with `bin/n2-handover <target pci>` (telnet `ci trigger_n2_ho`); OAI also triggers it from an A3 report, but the two radios get no PPS, so the cells are not time-aligned and the UE never reports the other cell, with OAI as with OCUDU ([note/troubleshooting.md](note/troubleshooting.md) section 6). Keep `time_src` internal: OAI blocks waiting for a PPS otherwise. The N2 interface of a gNB node must be at MTU 1500 like the core's: at 9000 the HandoverRequired (over 1500 bytes) is lost without any error and the handover stalls; `start-oai-gnb` resets it.
 
 The OCUDU configs are in [etc/ocudu/](etc/ocudu/), their run sheet is [note/commands.md](note/commands.md).
 
@@ -50,5 +50,7 @@ The OCUDU configs are in [etc/ocudu/](etc/ocudu/), their run sheet is [note/comm
 | [bin/n2-handover](bin/n2-handover) | cudu, cudu2 | Force an N2 handover of a UE to the other gNB's PCI |
 | [bin/handover-gnb](bin/handover-gnb) | cudu, cudu2 | Fade a UE between gNB 1 and gNB 2 (triggers a handover only if the UE reports the other cell; see the note above) |
 | [bin/ngap-capture](bin/ngap-capture) | cn5g | Capture NGAP (SCTP 38412) to a pcap |
+| [bin/oai-meas-log.py](bin/oai-meas-log.py) | cudu, cudu2 | Sample the UE measurement reports from OAI's `nrRRC_stats.log` as CSV (OAI does not log them) |
+| [bin/run-oai-n2-exp](bin/run-oai-n2-exp) | your machine | Whole OAI N2 handover run over SSH (hosts in `hosts.env`); results land in `traces/oai-<date>-<time>` |
 
 Run attenuator commands on the server nodes, not the NUCs. The OCUDU-only scripts (`deploy-ocudu.sh`, `start-inter-gnb`, `handover`, `meas-reports.py`, `run-inter-gnb-exp`, ...) are unused on this branch.

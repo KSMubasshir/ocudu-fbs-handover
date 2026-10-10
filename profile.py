@@ -108,7 +108,7 @@ Both gNBs also configure periodical reports and an A3 event (neighbour 3 dB bett
 /local/repository/bin/handover-gnb ue1 gnb2
 ```
 
-Whether this works depends on the UE measuring the other cell. The X310 and N300 get no PPS on this testbed, so the two cells are not time aligned; with OCUDU on the same hardware the Quectel modem never reported the neighbour and only forced handovers worked (see `note/troubleshooting.md` section 6). OAI's tutorial likewise asks for radios synchronized to a common clock and time reference, and for the same radio model on both gNBs.
+This did not trigger a handover when tested: the X310 and N300 get no PPS on this testbed, so the two cells are not time aligned, and the Quectel modem never reported the other cell, even with the serving cell 16 dB weaker (the same as with OCUDU on this hardware, see `note/troubleshooting.md` section 6). OAI's tutorial asks for radios synchronized to a common clock and time reference. Forced handovers with `n2-handover` work in both directions.
 
 Notes: the gains (`att_tx`, `att_rx`, `max_rxgain` in the `RUs` section of `etc/oai/*.conf`) are OAI's stock values for each radio and may need adjusting so both cells arrive at the UE at similar levels. `bin/start-oai-gnb -c external` switches the radio to the external 10 MHz reference. `bin/update-attens gnb2ue1|gnb2ue2` assumes the first eight N300 paths belong to `ue1` and the rest to `ue2`; check against `bin/atten -l`.
 

@@ -1,0 +1,274 @@
+#!/bin/bash
+# Run the OAI N2 handover experiment from your own machine: restart both gNBs,
+# attach ue1, capture NGAP on the core, force handovers back and forth, and
+# copy the NGAP capture, measurement reports, core and gNB logs, UE serving
+# cell log and ping log here.
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+HOSTS_FILE=$REPO/hosts.env
+REMOTE_BIN=/local/repository/bin
+OAI_BUILD=/var/tmp/oai/cmake_targets/ran_build/build
+NUM_HO=2
+HO_INTERVAL=10
+OUTDIR=""
+
+usage() {
+    cat <<EOF
+usage:
+    run-oai-n2-exp -h
+        show this help message
+    run-oai-n2-exp [-n <handovers>] [-i <seconds>] [-o <dir>] [-f <hosts file>]
+        -n  number of forced handovers, each from the gNB serving ue1 to the
+            other one: gNB 1 -> 2 -> 1 ... while they succeed (default $NUM_HO)
+        -i  seconds between handovers (default $HO_INTERVAL)
+        -o  local output directory (default traces/oai-<date>-<time> in the repo)
+        -f  file that sets SSH_USER, CN5G, CUDU, CUDU2 and UE1 (default hosts.env
+            in the repo); the hostnames change with every POWDER experiment
+
+    Both gNBs are restarted at the beginning and stopped at the end, so that
+    their logs hold exactly this run. OAI must already be built on cudu and
+    cudu2 (/var/tmp/oai-setup-complete).
+EOF
+}
+
+while getopts "hn:i:o:f:" opt; do
+    case $opt in
+        h) usage; exit 0 ;;
+        n) NUM_HO=$OPTARG ;;
+        i) HO_INTERVAL=$OPTARG ;;
+        o) OUTDIR=$OPTARG ;;
+        f) HOSTS_FILE=$OPTARG ;;
+        *) usage; exit 1 ;;
+    esac
+done
+
+if ! [[ $NUM_HO =~ ^[1-9][0-9]*$ ]] || ! [[ $HO_INTERVAL =~ ^[1-9][0-9]*$ ]]; then
+    echo "invalid -n or -i"; usage; exit 1
+fi
+
+if [ ! -f "$HOSTS_FILE" ]; then
+    echo "$HOSTS_FILE not found"; usage; exit 1
+fi
+source "$HOSTS_FILE"
+for var in SSH_USER CN5G CUDU CUDU2 UE1; do
+    if [ -z "${!var}" ]; then
+        echo "$var is not set in $HOSTS_FILE"; exit 1
+    fi
+done
+
+OUTDIR=${OUTDIR:-$REPO/traces/oai-$(date +%Y-%m-%d-%H%M%S)}
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15"
+
+# The login shell on the nodes is csh, so every remote command is fed to bash
+# on stdin: on <host> <<'EOF' ... EOF
+on() {
+    ssh $SSH_OPTS $SSH_USER@$1 'bash -s'
+}
+
+step() {
+    echo
+    echo "== $*"
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+# push <host> <file>...: install scripts from this checkout in the node's
+# repository, whatever branch and file ownership it has there.
+push() {
+    local host=$1
+    shift
+    ssh $SSH_OPTS $SSH_USER@$host 'mkdir -p /tmp/oai-exp-bin' || return 1
+    scp -q $SSH_OPTS "$@" $SSH_USER@$host:/tmp/oai-exp-bin/ || return 1
+    ssh $SSH_OPTS $SSH_USER@$host "sudo install -m 775 /tmp/oai-exp-bin/* $REMOTE_BIN/"
+}
+
+# start_gnb <host>: (re)start the node's gNB in a tmux session named gnb. Its
+# output goes to /tmp/gnb.log.
+start_gnb() {
+    on $1 <<EOF
+set -e
+[ -f /var/tmp/oai-setup-complete ] || { echo "\$(hostname -s): OAI is not built (bin/deploy-oai.sh)"; exit 1; }
+sudo pkill -INT -x nr-softmodem || true
+for i in \$(seq 30); do pgrep -x nr-softmodem > /dev/null || break; sleep 1; done
+sudo pkill -KILL -x nr-softmodem || true
+tmux kill-session -t gnb 2> /dev/null || true
+tmux kill-session -t meas 2> /dev/null || true
+sudo rm -f /tmp/gnb.log /tmp/meas.csv $OAI_BUILD/nrRRC_stats.log
+tmux new-session -d -s gnb -x 200 -y 50 $REMOTE_BIN/start-oai-gnb
+EOF
+}
+
+wait_gnb() {
+    on $1 <<'EOF'
+for i in $(seq 60); do
+    if grep -aq "Received NGSetupResponse" /tmp/gnb.log 2> /dev/null && grep -aq "RF started" /tmp/gnb.log; then
+        echo "$(hostname -s): gNB started"; exit 0
+    fi
+    pgrep -x nr-softmodem > /dev/null || [ $i -lt 5 ] || break
+    sleep 2
+done
+echo "$(hostname -s): gNB did not start:"; tail -n 15 /tmp/gnb.log
+exit 1
+EOF
+}
+
+# force_ho <host> <target pci>: trigger the handover for the UE that sent the
+# last measurement report (a gNB can hold a context without a connected UE).
+force_ho() {
+    on $1 <<EOF
+ID=\$(awk '/^UE /{id=\$6} /MeasResultNR/{last=id} END{print last}' $OAI_BUILD/nrRRC_stats.log 2> /dev/null)
+[ -n "\$ID" ] || exit 1
+echo "\$(date -u +%T.%3N) UTC  \$(hostname -s): n2-handover $2 \$ID"
+$REMOTE_BIN/n2-handover $2 \$ID > /dev/null
+EOF
+}
+
+step "Checking the nodes and copying the scripts"
+for host in $CN5G $CUDU $CUDU2 $UE1; do
+    ssh $SSH_OPTS $SSH_USER@$host true || die "cannot reach $host; update $HOSTS_FILE"
+done
+push $CN5G "$REPO/bin/ngap-capture" || die "copy to $CN5G failed"
+for host in $CUDU $CUDU2; do
+    push $host "$REPO/bin/start-oai-gnb" "$REPO/bin/n2-handover" "$REPO/bin/oai-meas-log.py" || die "copy to $host failed"
+done
+START=$(on $CN5G <<< 'date +%s')
+
+step "Starting gNB 1 on cudu and gNB 2 on cudu2"
+start_gnb $CUDU & pid1=$!
+start_gnb $CUDU2 & pid2=$!
+wait $pid1 || die "could not start the gNB on cudu"
+wait $pid2 || die "could not start the gNB on cudu2"
+wait_gnb $CUDU || die "gNB 1 is not running"
+wait_gnb $CUDU2 || die "gNB 2 is not running"
+
+step "Starting the NGAP capture on cn5g and the measurement report logs"
+on $CN5G <<EOF || die "could not start the NGAP capture"
+tmux kill-session -t ngap 2> /dev/null
+sudo pkill -INT -x tcpdump
+sudo rm -f /tmp/ngap.pcap
+tmux new-session -d -s ngap '$REMOTE_BIN/ngap-capture /tmp/ngap.pcap'
+sleep 2
+pgrep -x tcpdump > /dev/null
+EOF
+for host in $CUDU $CUDU2; do
+    on $host <<EOF || die "could not start the measurement report log on $host"
+tmux new-session -d -s meas '$REMOTE_BIN/oai-meas-log.py -o /tmp/meas.csv'
+EOF
+done
+
+step "Attaching ue1 to gNB 1"
+on $CUDU <<EOF || die "could not set the attenuators"
+$REMOTE_BIN/update-attens ru1ue1 0
+$REMOTE_BIN/update-attens gnb2ue1 95
+EOF
+on $UE1 <<EOF || die "ue1 did not get a data connection"
+tmux kill-session -t cell 2> /dev/null
+tmux kill-session -t ping 2> /dev/null
+pgrep -x quectel-CM > /dev/null || { tmux kill-session -t cm 2> /dev/null; tmux new-session -d -s cm 'sudo quectel-CM -s internet -4'; }
+$REMOTE_BIN/module-airplane.sh > /dev/null 2>&1
+sleep 3
+$REMOTE_BIN/module-on.sh > /dev/null 2>&1
+for i in \$(seq 45); do
+    ping -c 1 -W 1 10.45.0.1 > /dev/null 2>&1 && { echo "ue1 reaches 10.45.0.1"; exit 0; }
+    sleep 2
+done
+exit 1
+EOF
+
+step "Starting the ping and the serving cell log on ue1"
+on $UE1 <<'EOF' || die "could not start the ping"
+rm -f /tmp/ping-ho.out /tmp/ue-cell.out
+tmux new-session -d -s ping "bash -c 'ping -D -i 0.1 10.45.0.1 > /tmp/ping-ho.out 2>&1'"
+cat > /tmp/ue-cell-log.sh <<'EOS'
+#!/bin/bash
+# One line per second: time and the modem's serving cell (AT+QENG).
+while true; do
+    CELL=$(sudo sh -c "chat -t 2 -sv '' AT OK 'AT+QENG=\"servingcell\"' OK < /dev/ttyUSB2 > /dev/ttyUSB2" 2>&1 | grep -a "^+QENG" | tr -d '\r')
+    echo "$(date +%s.%3N) $CELL"
+    sleep 1
+done
+EOS
+chmod +x /tmp/ue-cell-log.sh
+tmux new-session -d -s cell "bash -c '/tmp/ue-cell-log.sh > /tmp/ue-cell.out 2>&1'"
+EOF
+
+step "Bringing both cells to similar levels at ue1"
+on $CUDU <<EOF || die "could not set the attenuators"
+$REMOTE_BIN/update-attens ru1ue1 5
+$REMOTE_BIN/update-attens gnb2ue1 0
+EOF
+
+step "Forcing $NUM_HO handover(s), $HO_INTERVAL s apart"
+for n in $(seq $NUM_HO); do
+    sleep $HO_INTERVAL
+    # after a failed handover the UE is back on the source gNB, so ask both
+    force_ho $CUDU 3 || force_ho $CUDU2 1 || echo "handover $n was not triggered: no connected UE on either gNB"
+done
+sleep $HO_INTERVAL
+
+step "Stopping the ping, the logs, the capture and both gNBs"
+on $UE1 <<'EOF'
+tmux send-keys -t ping C-c
+sleep 1
+tmux kill-session -t ping 2> /dev/null
+tmux kill-session -t cell 2> /dev/null
+true
+EOF
+on $CN5G <<EOF
+tmux send-keys -t ngap C-c
+sleep 1
+sudo pkill -INT -x tcpdump
+sudo journalctl -u open5gs-amfd -u open5gs-smfd -u open5gs-upfd --since @$START --no-pager -o short-precise | sed 's/\x1b\[[0-9;]*m//g' > /tmp/core.log
+tshark -r /tmp/ngap.pcap -Y ngap -t ad 2> /dev/null | grep -i "handover\|RANStatusTransfer\|successful-handover" > /tmp/ngap-handover.txt
+true
+EOF
+for host in $CUDU $CUDU2; do
+    on $host <<EOF
+tmux send-keys -t meas C-c
+cp $OAI_BUILD/nrRRC_stats.log /tmp/nrRRC_stats.last 2> /dev/null
+sudo pkill -INT -x nr-softmodem
+for i in \$(seq 30); do pgrep -x nr-softmodem > /dev/null || break; sleep 1; done
+sudo pkill -KILL -x nr-softmodem
+tmux kill-session -t meas 2> /dev/null
+true
+EOF
+done
+
+step "Copying the results to $OUTDIR"
+mkdir -p "$OUTDIR" || die "cannot create $OUTDIR"
+fetch() {
+    scp -q -C $SSH_OPTS $SSH_USER@$1:$2 "$OUTDIR/$3" || echo "could not fetch $2 from $1"
+}
+fetch $CN5G /tmp/ngap.pcap ngap.pcap
+fetch $CN5G /tmp/ngap-handover.txt ngap-handover.txt
+fetch $CN5G /tmp/core.log core.log
+fetch $UE1 /tmp/ping-ho.out ping-ue1.txt
+fetch $UE1 /tmp/ue-cell.out ue1-serving-cell.txt
+fetch $CUDU /tmp/meas.csv meas-gnb1.csv
+fetch $CUDU2 /tmp/meas.csv meas-gnb2.csv
+fetch $CUDU /tmp/gnb.log gnb1.log
+fetch $CUDU2 /tmp/gnb.log gnb2.log
+fetch $CUDU /tmp/nrRRC_stats.last gnb1-nrRRC_stats.log
+fetch $CUDU2 /tmp/nrRRC_stats.last gnb2-nrRRC_stats.log
+for gnb in 1 2; do
+    sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/gnb$gnb.log" 2> /dev/null \
+        | grep -a -i "handover\|HO LOG\|trigger_n2_ho\|N2 HO\|HO Command\|RAN Status Transfer\|HO-completed\|RRC Release" \
+        > "$OUTDIR/gnb$gnb-handover.txt"
+done
+ls -l "$OUTDIR"
+
+step "Summary"
+NOTIFY=$(grep -c "HandoverNotify" "$OUTDIR/ngap-handover.txt" 2> /dev/null)
+FAILED=$(grep -c "HandoverFailure\|HandoverPreparationFailure\|HandoverCancel \[" "$OUTDIR/ngap-handover.txt" 2> /dev/null)
+echo "handovers completed (HandoverNotify): ${NOTIFY:-?} of $NUM_HO, failed or cancelled: ${FAILED:-?}"
+echo "ping: $(grep "packets transmitted" "$OUTDIR/ping-ue1.txt" 2> /dev/null || echo "no statistics")"
+for gnb in 1 2; do
+    f="$OUTDIR/meas-gnb$gnb.csv"
+    [ -f "$f" ] && echo "gNB $gnb measurement report samples: $(grep -c ",serving," "$f") (neighbour rows: $(grep -c ",neighbour," "$f"))"
+done
+
+if [ "$NOTIFY" != "$NUM_HO" ]; then
+    exit 1
+fi

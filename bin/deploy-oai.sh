@@ -11,13 +11,15 @@ if [ -f $SRCDIR/oai-setup-complete ]; then
 fi
 
 # install UHD 4.10 debs vendored in the repo (Ettus PPA moved on to 4.11).
-# build_oai -I is run without -w USRP below so it does not install another UHD.
+# build_oai -I is run without -w USRP below so it does not install another UHD;
+# it then also leaves out the Boost libraries UHD's CMake config asks for.
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $DEBDIR/*.deb
 
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   git \
   iperf3 \
+  libboost-all-dev \
   netcat-openbsd \
   numactl
 

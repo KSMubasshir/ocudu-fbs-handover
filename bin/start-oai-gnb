@@ -69,6 +69,15 @@ fi
 
 /local/repository/bin/tune-sdr-iface.sh > /dev/null
 
+# The N2 link must not have a larger MTU than the core's interface (1500):
+# HandoverRequired is bigger than 1500 bytes and is silently lost as a jumbo
+# frame, while every smaller NGAP message still gets through.
+LANIF=$(ip -4 -o addr show | awk -v ip="$LANIP" '$4 ~ "^"ip"/" {print $2}')
+if [ "$(cat /sys/class/net/$LANIF/mtu)" -gt 1500 ]; then
+    echo "setting MTU of $LANIF ($LANIP) to 1500"
+    sudo ip link set $LANIF mtu 1500
+fi
+
 echo "starting $NAME with $CFG"
 grep -n "clock_src\|time_src" $CFG
 # nr-softmodem writes nrRRC_stats.log (UE IDs for bin/n2-handover) to its
@@ -77,4 +86,4 @@ cd $BUILDDIR
 sudo $RUN ./nr-softmodem -O $CFG $RADIO_ARGS \
     --gNBs.[0].min_rxtxtime 6 --usrp-tx-thread-config 1 \
     --telnetsrv --telnetsrv.shrmod ci --telnetsrv.listenaddr $TELNET_ADDR \
-    2>&1 | tee /tmp/gnb.log
+    2>&1 | sudo tee /tmp/gnb.log
