@@ -33,7 +33,8 @@ git checkout $COMMIT_HASH
 
 cd cmake_targets
 ./build_oai -I
-# telnetsrv carries the "ci trigger_n2_ho" command used to force a handover
+# telnetsrv is kept for manual gNB inspection (and the ci commands used by the
+# handover branch); harmless on this branch
 ./build_oai --ninja --gNB -w USRP --build-lib telnetsrv
 
 echo configuring nodeb...

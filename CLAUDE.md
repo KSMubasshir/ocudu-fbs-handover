@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a **POWDER testbed profile** for 5G handover experiments on the conducted RF attenuator matrix. It is based on `https://gitlab.flux.utah.edu/dmaas/srs-rf-matrix`, with the N300 node turned into a second, separate gNB for inter-gNB handover. There is no O-RAN RIC or shared VLAN.
 
-On this branch (`oai-n2-handover`) both gNBs are **OpenAirInterface (OAI)** gNBs and the profile follows the N2 handover section of OAI's [handover tutorial](https://github.com/OPENAIRINTERFACE/openairinterface5g/blob/develop/doc/handover-tutorial.md#n2-handover), with Open5GS as the core. The OCUDU scripts, configs and notes from the `optional-second-gnb` branch are still in the tree but [profile.py](profile.py) does not use them. Tested on the testbed on 2026-10-09: forced N2 handovers work in both directions (five in a row, about 190 ms each); measurement-triggered handover does not, because the UE never reports the other cell.
+On this branch (`oai-second-core`) both gNBs are **OpenAirInterface (OAI)** gNBs, but each is on its **own Open5GS core**: gNB 1 on `cn5g` (home PLMN 999/99) and gNB 2 on `cn5g2` (foreign PLMN 001/01). There is no Xn/N2 link and no shared core, so there is no handover between the gNBs — this is the "second gNB not connected to the (same) core" variant. A gNB cannot run without a core, hence the second one. The Quectel SIMs are homed on 999/99, so in SA the UE registers on gNB 1 and only sees (does not register on) gNB 2's foreign cell. It derives from the `oai-n2-handover` branch (tested N2 handover with one shared core); the OCUDU scripts/configs/notes from `optional-second-gnb` are still in the tree but unused. This branch has not been run on the testbed (the second core node does not exist on the earlier instantiation).
 
 The entry point is [profile.py](profile.py). The previous LTE/srsRAN 4G profile is kept unchanged under [legacy-lte/](legacy-lte/) and is not used by the 5G profile.
 
@@ -22,19 +22,22 @@ Experiments are instantiated via the [POWDER](https://powderwireless.net) portal
 
 | Node | Hardware | Role |
 |------|----------|------|
-| `cn5g` | d430 | Open5GS core (192.168.1.1) |
-| `cudu` | d740 + `x310-1` | gNB 1, gNB ID 411, PCI 1 (192.168.1.2) |
-| `cudu2` | d740 + `n300-2` | gNB 2, gNB ID 412, PCI 3 (192.168.1.3) |
-| `ue1`, `ue2` | `nuc27`, `nuc22` | Quectel RM520 COTS UEs |
+| `cn5g` | d430 | Open5GS core 1, PLMN 999/99 (192.168.1.1) |
+| `cudu` | d740 + `x310-1` | gNB 1 -> core 1, gNB ID 411, PCI 1 (192.168.1.2) |
+| `cn5g2` | d430 | Open5GS core 2, PLMN 001/01 (192.168.1.4) |
+| `cudu2` | d740 + `n300-2` | gNB 2 -> core 2, gNB ID 412, PCI 3 (192.168.1.3) |
+| `ue1`, `ue2` | `nuc27`, `nuc22` | Quectel RM520 COTS UEs (SIMs homed on 999/99) |
 
 RF paths in the matrix are fixed by POWDER staff; only attenuation values can be changed.
 
 ## OAI gNB configs ([etc/oai/](etc/oai/))
 
-- `gnb1_x310_n2_ho.conf`, `gnb2_n300_n2_ho.conf` — one band 78, 106 PRB cell each on the same carrier, derived from OAI's `gnb.sa.band78.fr1.106PRB.pci0.rfsim.conf`. Apart from the header comment they differ only in gNB ID, `nr_cellid` (gNB ID * 256 + 1), PCI, PRACH root sequence, `ssb_PositionsInBurst_Bitmap`, N2/N3 address and the `RUs` section.
-- `neighbour-config.conf` — neighbour list and measurement events, `@include`d by both.
+- `gnb1_x310_core1.conf` — gNB 1, PLMN 999/99, AMF 192.168.1.1 (core 1).
+- `gnb2_n300_core2.conf` — gNB 2, PLMN **001/01**, AMF **192.168.1.4** (core 2). Its NG/NGU interface is still the node's own 192.168.1.3.
 
-`bin/start-oai-gnb` adds the radio options: `-E --continuous-tx` on the X310 (46.08 Msps from its 184.32 MHz clock), none on the N300 (61.44 Msps from 122.88 MHz). The handover is forced with `bin/n2-handover <target pci>` (telnet `ci trigger_n2_ho`); OAI also triggers it from an A3 report, but the two radios get no PPS, so the cells are not time-aligned and the UE never reports the other cell, with OAI as with OCUDU ([note/troubleshooting.md](note/troubleshooting.md) section 6). Keep `time_src` internal: OAI blocks waiting for a PPS otherwise. The N2 interface of a gNB node must be at MTU 1500 like the core's: at 9000 the HandoverRequired (over 1500 bytes) is lost without any error and the handover stalls; `start-oai-gnb` resets it.
+Both are derived from OAI's `gnb.sa.band78.fr1.106PRB.pci0.rfsim.conf` (one band 78, 106 PRB cell on the same carrier) and differ in gNB ID, `nr_cellid` (gNB ID * 256 + 1), PCI, PRACH root sequence, `ssb_PositionsInBurst_Bitmap`, PLMN, AMF address and the `RUs` section. Neither includes a neighbour list: there is no handover on this branch. The foreign PLMN lives in two places that must agree — `plmn_list` in `gnb2_n300_core2.conf` and the `FOREIGN_MCC`/`FOREIGN_MNC` constants in [profile.py](profile.py) that are passed to `deploy-open5gs.sh` on `cn5g2`.
+
+`bin/start-oai-gnb` adds the radio options: `-E --continuous-tx` on the X310 (46.08 Msps from its 184.32 MHz clock), none on the N300 (61.44 Msps from 122.88 MHz). Keep `time_src` internal: OAI blocks waiting for a PPS otherwise. `start-oai-gnb` also forces the node's 192.168.1.x interface to MTU 1500 (carried over from the handover branch, where a 9000 MTU silently dropped the oversized HandoverRequired; harmless here).
 
 The OCUDU configs are in [etc/ocudu/](etc/ocudu/), their run sheet is [note/commands.md](note/commands.md).
 
@@ -42,15 +45,13 @@ The OCUDU configs are in [etc/ocudu/](etc/ocudu/), their run sheet is [note/comm
 
 | Script | Node | Purpose |
 |--------|------|---------|
-| [bin/deploy-open5gs.sh](bin/deploy-open5gs.sh) | cn5g | Install Open5GS, add the two subscribers |
+| [bin/deploy-open5gs.sh](bin/deploy-open5gs.sh) | cn5g, cn5g2 | Install Open5GS + subscribers; no args = core 1 (999/99), `<mcc> <mnc>` = a second core on another node (NGAP/N3 bound to the node's own 192.168.1.x) |
 | [bin/deploy-oai.sh](bin/deploy-oai.sh) | cudu, cudu2 | Build OAI (gNB, USRP, telnet server), copy gNB configs |
 | [bin/setup-cots-ue.sh](bin/setup-cots-ue.sh) | ue1, ue2 | Quectel modem setup |
 | [bin/update-attens](bin/update-attens) | cudu, cudu2 | Set a path group (`ru1ue1`, `ru2ue1`, `gnb2ue1`, ...) to 0..95 (+30 dB) |
-| [bin/start-oai-gnb](bin/start-oai-gnb) | cudu, cudu2 | Start the node's OAI gNB with the telnet server; output to `/tmp/gnb.log` |
-| [bin/n2-handover](bin/n2-handover) | cudu, cudu2 | Force an N2 handover of a UE to the other gNB's PCI |
-| [bin/handover-gnb](bin/handover-gnb) | cudu, cudu2 | Fade a UE between gNB 1 and gNB 2 (triggers a handover only if the UE reports the other cell; see the note above) |
-| [bin/ngap-capture](bin/ngap-capture) | cn5g | Capture NGAP (SCTP 38412) to a pcap |
+| [bin/start-oai-gnb](bin/start-oai-gnb) | cudu, cudu2 | Start the node's OAI gNB (gNB 1 -> core 1, gNB 2 -> core 2); output to `/tmp/gnb.log` |
+| [bin/handover-gnb](bin/handover-gnb) | cudu, cudu2 | Fade a UE between gNB 1 and gNB 2 (no handover here, just signal levels) |
+| [bin/ngap-capture](bin/ngap-capture) | cn5g, cn5g2 | Capture that core's NGAP (SCTP 38412) to a pcap |
 | [bin/oai-meas-log.py](bin/oai-meas-log.py) | cudu, cudu2 | Sample the UE measurement reports from OAI's `nrRRC_stats.log` as CSV (OAI does not log them) |
-| [bin/run-oai-n2-exp](bin/run-oai-n2-exp) | your machine | Whole OAI N2 handover run over SSH (hosts in `hosts.env`); results land in `traces/oai-<date>-<time>` |
 
-Run attenuator commands on the server nodes, not the NUCs. The OCUDU-only scripts (`deploy-ocudu.sh`, `start-inter-gnb`, `handover`, `meas-reports.py`, `run-inter-gnb-exp`, ...) are unused on this branch.
+Run attenuator commands on the server nodes, not the NUCs. The OCUDU-only scripts (`deploy-ocudu.sh`, `start-inter-gnb`, `handover`, `meas-reports.py`, `run-inter-gnb-exp`, ...) are unused on this branch. The N2 handover helper (`n2-handover`) and whole-run script (`run-oai-n2-exp`) exist only on the `oai-n2-handover` branch, since this variant has no handover.
