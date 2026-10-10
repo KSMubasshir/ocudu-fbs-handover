@@ -96,6 +96,24 @@ ping is uninterrupted. If a UE that does inter-frequency reporting is used, the
 spontaneous path logs the same cause: `received A3 event for stronger neighbor
 PCI 3, but no such neighbour in configuration`.
 
+## Collecting data per node
+
+The whole run above (`bin/run-failed-ho-exp`) runs from a machine with SSH
+access to every node and copies all traces to `traces/`. If instead you run the
+steps by hand while logged into the nodes, run `bin/collect-node` on each node
+afterwards to bundle that node's own data:
+
+```
+# on cudu, cudu2, cn5g, cn5g2, ue1 -- each gathers only its own data
+/local/repository/bin/collect-node
+```
+
+It writes `/var/tmp/collect-<host>-<time>/` and a `.tar.gz`, and prints the
+`scp` line to fetch it. gNB nodes get the gNB log, RRC/MAC/L1 stats and the
+config; core nodes get the AMF/SMF/UPF log, the PLMN and any NGAP pcap; UE nodes
+get the modem serving/neighbour cells and ping logs. It does not reach other
+nodes (the experiment nodes cannot SSH to each other), so run it on each one.
+
 ## Why the handover is forced, not UE-initiated
 
 On this testbed the Quectel does not emit the measurement report: connected to

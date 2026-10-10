@@ -1,0 +1,93 @@
+#!/bin/bash
+# Collect this node's experiment data into a tarball. Run it directly on any
+# node (cn5g, cn5g2, cudu, cudu2, ue1, ue2); it detects the node's role from
+# its hostname and gathers the relevant logs, captures and radio/modem state.
+# Nothing here reaches other nodes -- run it on each node you care about, then
+# scp the tarballs off. Meant for manual runs (the run sheets in note/); the
+# whole-experiment orchestrator is bin/run-failed-ho-exp, run from a machine
+# with SSH access to every node.
+set -u
+OAI_BUILD=/var/tmp/oai/cmake_targets/ran_build/build
+HOST=$(hostname -s)
+TS=$(date +%Y-%m-%d-%H%M%S)
+OUT=/var/tmp/collect-$HOST-$TS
+mkdir -p "$OUT"
+
+say() { echo "  $*"; }
+have() { command -v "$1" > /dev/null 2>&1; }
+
+echo "collecting on $HOST into $OUT"
+
+# ---- common ----
+{
+    echo "host: $(hostname -f)"
+    echo "date: $(date -u +%FT%TZ)"
+    echo "uname: $(uname -a)"
+    echo "repo: $(git -C /local/repository log -1 --format='%h %d %s' 2>/dev/null)"
+    echo "ip 192.168.1.x: $(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | grep '^192\.168\.1\.' | tr '\n' ' ')"
+} > "$OUT/node-info.txt"
+
+case "$HOST" in
+    cudu|cudu2)
+        say "gNB node: gNB log, RRC/MAC/L1 stats, config, handover/meas lines"
+        sudo cp /tmp/gnb.log "$OUT/gnb.log" 2>/dev/null && sudo chmod 644 "$OUT/gnb.log"
+        for f in nrRRC_stats.log nrMAC_stats.log nrL1_stats.log; do
+            cp "$OAI_BUILD/$f" "$OUT/$f" 2>/dev/null
+        done
+        # which config this node runs, and its key fields
+        LANIP=$(ip -4 -o addr show | awk '{print $4}' | grep '^192\.168\.1\.' | cut -d/ -f1)
+        case "$LANIP" in
+            192.168.1.2) CFG=/var/tmp/etc/oai/gnb1_x310_core1.conf ;;
+            192.168.1.3) CFG=/var/tmp/etc/oai/gnb2_n300_core2.conf ;;
+            *) CFG="" ;;
+        esac
+        if [ -n "$CFG" ] && [ -f "$CFG" ]; then
+            cp "$CFG" "$OUT/" 2>/dev/null
+            # the phantom/measure-only include, if present
+            cp /var/tmp/etc/oai/neighbour-config-*.conf "$OUT/" 2>/dev/null
+        fi
+        if [ -f "$OUT/gnb.log" ]; then
+            sed 's/\x1b\[[0-9;]*m//g' "$OUT/gnb.log" \
+                | grep -aE "Neighbour\[|trigger_n2|N2 HO|Handover|could not find neighbour|no such neighbour|NGSetup|RF started" \
+                > "$OUT/gnb-handover.txt"
+        fi
+        ;;
+    cn5g|cn5g2)
+        say "core node: AMF/SMF/UPF log, PLMN, any NGAP pcap"
+        sudo journalctl -u open5gs-amfd -u open5gs-smfd -u open5gs-upfd --since "-30 min" \
+            --no-pager -o short-precise 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' > "$OUT/core.log"
+        grep -A3 "plmn_support\|guami" /etc/open5gs/amf.yaml 2>/dev/null > "$OUT/amf-plmn.txt"
+        systemctl is-active 'open5gs-*' 2>/dev/null | sort | uniq -c > "$OUT/open5gs-services.txt" 2>/dev/null
+        for p in /tmp/ngap*.pcap /tmp/*.pcap; do
+            [ -f "$p" ] || continue
+            sudo cp "$p" "$OUT/" 2>/dev/null && sudo chmod 644 "$OUT/$(basename "$p")"
+            have tshark && sudo tshark -r "$p" -Y ngap 2>/dev/null > "$OUT/$(basename "$p" .pcap)-ngap.txt"
+        done
+        ;;
+    ue1|ue2)
+        say "UE node: modem serving + neighbour cells, ping/metrics logs"
+        AT() { sudo sh -c "chat -t 6 -sv '' AT OK '$1' OK < /dev/ttyUSB2 > /dev/ttyUSB2" 2>&1 | grep -a "^+" | tr -d '\r'; }
+        {
+            echo "# AT+QENG servingcell / neighbourcell at $(date -u +%FT%TZ)"
+            AT 'AT+QENG="servingcell"'
+            AT 'AT+QENG="neighbourcell"'
+            AT 'AT+CFUN?'
+        } > "$OUT/modem-cells.txt" 2>/dev/null
+        for f in /tmp/ping*.out /tmp/ping*.log /tmp/ue-cell*.out /tmp/ue-scan*.out /tmp/ue-*.txt; do
+            [ -f "$f" ] && cp "$f" "$OUT/" 2>/dev/null
+        done
+        ip -4 -o addr show 2>/dev/null | awk '{print $2, $4}' > "$OUT/ue-ifaces.txt"
+        ;;
+    *)
+        say "unknown node role '$HOST'; collected node-info.txt only"
+        ;;
+esac
+
+TAR=/var/tmp/collect-$HOST-$TS.tar.gz
+tar -C /var/tmp -czf "$TAR" "collect-$HOST-$TS" 2>/dev/null
+echo "done:"
+echo "  dir:    $OUT"
+echo "  tar:    $TAR"
+echo "  files:  $(ls -1 "$OUT" | tr '\n' ' ')"
+echo "fetch it from your machine with:"
+echo "  scp $(whoami)@<this node's control hostname>:$TAR ."
