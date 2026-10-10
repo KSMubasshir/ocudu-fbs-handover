@@ -21,7 +21,7 @@ The following will be deployed:
 - OAI gNB 2 (`cudu2`, Dell R740 + USRP N300) -> core 2: gNB ID 412, PCI 3
 - 2 Intel NUCs w/ Quectel RM520 COTS UEs
 
-Each gNB serves one 40 MHz (106 PRB, 30 kHz SCS) band 78 cell on the same carrier. The Quectel SIMs are homed on 999/99, so in SA the UE registers on gNB 1 (core 1) and does not register on gNB 2's foreign PLMN; gNB 2 is there to be seen/measured and to be driven from its own core.
+Each gNB serves one 40 MHz (106 PRB, 30 kHz SCS) band 78 cell, on separate carriers: gNB 1 at 3619.2 MHz (SSB ARFCN 641280), gNB 2 at 3319.68 MHz (SSB ARFCN 621312), so a modem network scan lists gNB 2's cell as its own entry. The Quectel SIMs are homed on 999/99, so in SA the UE registers on gNB 1 (core 1) and does not register on gNB 2's foreign PLMN; gNB 2 is there to be seen/measured and to be driven from its own core.
 
 #### Measurements and observation points
 

@@ -19,13 +19,16 @@ CN5G2=<cn5g2 hostname>
 ```
 
 ```
-bin/run-second-core-exp            # 30 s per phase, with scan and fade
+bin/run-second-core-exp            # 30 s per phase, with scan and modem restart
 bin/run-second-core-exp -d 60 -S   # 60 s per phase, no modem scan
 ```
 
-Phases: ue1 attached on gNB 1 alone; both cells at similar levels (plus an
-`AT+QSCAN` network scan); gNB 1 faded out with only the foreign cell left;
-gNB 1 back. `timeline.txt` has the UTC time of every phase change. Fetched:
+Phases: ue1 attached on gNB 1 alone; gNB 2 overpowers gNB 1 (gNB 2's paths
+at minimum attenuation, the N300 at full TX gain, gNB 1 left at its attach
+level) plus an `AT+QSCAN` network scan; then, still overpowered, a modem
+restart (airplane mode off/on, each confirmed with `AT+CFUN?`) to see which
+network it selects. The runner first installs the gNB configs from this
+checkout's `etc/oai` on the gNB nodes. `timeline.txt` has the UTC time of every phase change. Fetched:
 both cores' NGAP pcap, NGAP text and AMF/SMF/UPF log, both gNB logs and
 sampled measurement reports, ue1's serving cell once a second, the ping and
 the scan.
@@ -140,15 +143,30 @@ UPF.
 cd /local/repository && uv run bin/quectel_control.py scan
 ```
 
-The scan (`AT+QSCAN`) should list the foreign cell (PLMN 001/01, PCI 3)
-alongside the home cell (999/99, PCI 1). The modem stays registered on gNB 1:
-`ue_metrics.py` keeps reporting PCI 1 and the ping keeps flowing. Fading gNB 1
-down does not move the UE onto 001/01 in SA; it drops instead.
+The scan (`AT+QSCAN`) lists the foreign cell on its own carrier, printed as
+`"NR5G",  1,01,621312,3,...` (MCC 001, MNC 01, SSB ARFCN 621312, PCI 3). The
+modem stays registered on gNB 1: `ue_metrics.py` keeps reporting PCI 1. The
+scan itself interrupts data for about 15 s and the modem re-registers on its
+home network afterwards.
+
+Do not fade gNB 1 to make the foreign cell dominant: at the maximum setting
+gNB 1 still leaks through the matrix at about -118 dBm and the UE keeps it.
+gNB 2 at `gnb2ue1 0` with the N300 at full gain arrives at about -83 dBm, about
+1-2 dB above gNB 1 at `ru1ue1 0` (-84/-85 dBm); that is as far as gNB 2 can be
+pushed without touching gNB 1.
+
+### Restart the modem while gNB 2 overpowers (ue1)
+
+`module-airplane.sh`/`module-on.sh` give the modem one second and ignore
+failures; right after a scan the command can be lost. Confirm the state:
 
 ```
-# optional: fade toward gNB 2 and watch the UE lose service, not hand over
-/local/repository/bin/handover-gnb ue1 gnb2
+sudo sh -c "chat -t 5 -sv '' AT OK 'AT+CFUN=4' OK < /dev/ttyUSB2 > /dev/ttyUSB2"
+sudo sh -c "chat -t 3 -sv '' AT OK 'AT+CFUN?' OK < /dev/ttyUSB2 > /dev/ttyUSB2"
 ```
+
+then `AT+CFUN=1` the same way. The modem selects its home network (999/99,
+PCI 1) again, not the stronger foreign cell.
 
 ## 6. Observe gNB 2 standalone (optional)
 
