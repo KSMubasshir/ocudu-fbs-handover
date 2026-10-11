@@ -9,8 +9,11 @@
 # then force gNB 1 toward gNB 2's PCI (standing in for the UE's request: the
 # Quectel does not spontaneously report a neighbour on this testbed). gNB 1
 # cannot resolve the unknown PCI to a target, so no HandoverRequired is sent
-# and the UE stays on gNB 1. Capture core 1's NGAP (expected empty of
-# handover), the AMF log, gNB 1's log and the UE serving cell.
+# and the UE stays on gNB 1. Capture the NGAP of both cores from before the
+# gNBs start (expected: NG setup and the registration on core 1, no handover
+# message on either), both AMF logs, both gNB logs, the UE measurement reports
+# seen by each gNB and the UE serving cell. The captures run to the very end:
+# ue1 is detached (airplane mode) and both gNBs are stopped before they close.
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 HOSTS_FILE=$REPO/hosts.env
 REMOTE_BIN=/local/repository/bin
@@ -98,12 +101,27 @@ step "Checking the nodes and installing scripts/configs"
 for host in $CN5G $CN5G2 $CUDU $CUDU2 $UE1; do
     ssh $SSH_OPTS $SSH_USER@$host true || die "cannot reach $host; update $HOSTS_FILE"
 done
-push $CN5G "$REPO/bin/ngap-capture" || die "copy to $CN5G failed"
+for host in $CN5G $CN5G2; do
+    push $host "$REPO/bin/ngap-capture" || die "copy to $host failed"
+done
 for host in $CUDU $CUDU2; do
-    push $host "$REPO/bin/start-oai-gnb" || die "copy to $host failed"
+    push $host "$REPO/bin/start-oai-gnb" "$REPO/bin/oai-meas-log.py" || die "copy to $host failed"
 done
 push_cfg $CUDU "$REPO/etc/oai/gnb1_x310_core1.conf" "$REPO/etc/oai/neighbour-config-measonly.conf" || die "config copy to $CUDU failed"
 push_cfg $CUDU2 "$REPO/etc/oai/gnb2_n300_core2.conf" || die "config copy to $CUDU2 failed"
+
+step "Capturing NGAP on core 1 and core 2"
+for host in $CN5G $CN5G2; do
+    on $host <<EOF || die "could not start the NGAP capture on $host"
+tmux kill-session -t ngap 2> /dev/null
+sudo pkill -INT -x tcpdump
+sudo rm -f /tmp/ngap.pcap
+tmux new-session -d -s ngap '$REMOTE_BIN/ngap-capture /tmp/ngap.pcap'
+sleep 2
+pgrep -x tcpdump > /dev/null
+EOF
+done
+START=$(on $CN5G <<< 'date +%s')
 
 step "Starting gNB 1 (-> core 1) on cudu and gNB 2 (-> core 2) on cudu2"
 start_gnb $CUDU & p1=$!
@@ -115,6 +133,12 @@ wait_gnb $CUDU2 || die "gNB 2 is not running"
 on $CUDU <<'EOF'
 grep -a "Neighbour\[0\]" /tmp/gnb.log | head -1
 EOF
+for host in $CUDU $CUDU2; do
+    on $host <<EOF || die "could not start the measurement log on $host"
+tmux kill-session -t meas 2> /dev/null; sudo rm -f /tmp/meas.csv
+tmux new-session -d -s meas 'sudo $REMOTE_BIN/oai-meas-log.py -o /tmp/meas.csv'
+EOF
+done
 
 step "Attaching ue1 to gNB 1 (gNB 1 only reaches ue1 at first)"
 on $CUDU <<EOF || die "could not set attenuators"
@@ -143,16 +167,7 @@ $REMOTE_BIN/update-attens gnb2ue1 0
 EOF
 sleep 5
 
-step "Capturing core 1 NGAP and forcing a handover toward gNB 2's unknown PCI"
-on $CN5G <<EOF || die "could not start the NGAP capture"
-tmux kill-session -t ngap 2> /dev/null
-sudo pkill -INT -x tcpdump
-sudo rm -f /tmp/ngap.pcap
-tmux new-session -d -s ngap '$REMOTE_BIN/ngap-capture /tmp/ngap.pcap'
-sleep 2
-pgrep -x tcpdump > /dev/null
-EOF
-START=$(on $CN5G <<< 'date +%s')
+step "Forcing a handover toward gNB 2's unknown PCI"
 UE=$(on $CUDU <<< "sudo grep -oE 'CU UE ID [0-9]+' $OAI_BUILD/nrRRC_stats.log | grep -oE '[0-9]+' | tail -1")
 [ -n "$UE" ] || die "no UE on gNB 1"
 echo "UE id on gNB 1 = $UE; triggering ci trigger_n2_ho $TARGET_PCI,$UE"
@@ -161,44 +176,62 @@ echo ci trigger_n2_ho $TARGET_PCI,$UE | nc -w 2 127.0.0.1 9090
 EOF
 sleep 6
 
-step "Stopping capture and collecting results in $OUTDIR"
-on $CN5G <<EOF
-tmux send-keys -t ngap C-c
-sleep 1
-sudo pkill -INT -x tcpdump
-sudo journalctl -u open5gs-amfd --since @$START --no-pager -o short-precise 2> /dev/null | sed 's/\x1b\[[0-9;]*m//g' > /tmp/amf.log
-sudo tshark -r /tmp/ngap.pcap -Y ngap 2> /dev/null > /tmp/ngap.txt
-true
-EOF
-on $UE1 <<'EOF'
+step "Reading the UE serving cell, then detaching ue1 (airplane mode)"
+on $UE1 <<EOF
 tmux send-keys -t ping C-c; sleep 1; tmux kill-session -t ping 2> /dev/null
 sudo sh -c 'chat -t 5 -sv "" AT OK "AT+QENG=\"servingcell\"" OK < /dev/ttyUSB2 > /dev/ttyUSB2' 2>&1 | grep -a "^+QENG" | tr -d '\r' > /tmp/ue-cell.txt
 cat /tmp/ue-cell.txt
+$REMOTE_BIN/module-airplane.sh > /dev/null 2>&1
 EOF
-fetch() { scp -q -C $SSH_OPTS $SSH_USER@$1:$2 "$OUTDIR/$3" || echo "could not fetch $2 from $1"; }
-fetch $CN5G /tmp/ngap.pcap core1-ngap.pcap
-fetch $CN5G /tmp/ngap.txt core1-ngap.txt
-fetch $CN5G /tmp/amf.log core1-amf.log
-fetch $CUDU /tmp/gnb.log gnb1.log
-fetch $CUDU2 /tmp/gnb.log gnb2.log
-fetch $UE1 /tmp/ue-cell.txt ue1-serving-cell.txt
-fetch $UE1 /tmp/ping-ho.out ping-ho.out
-sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/gnb1.log" 2> /dev/null | grep -aE "trigger_n2|N2 HO|Handover|neighbour" > "$OUTDIR/gnb1-handover.txt"
+sleep 8
 
 step "Stopping both gNBs"
 for host in $CUDU $CUDU2; do
     on $host <<'EOF'
+tmux send-keys -t meas C-c 2> /dev/null; sleep 1; tmux kill-session -t meas 2> /dev/null
 tmux send-keys -t gnb C-c 2> /dev/null; sleep 1
 sudo pkill -INT -x nr-softmodem; sleep 2; sudo pkill -KILL -x nr-softmodem
 tmux kill-session -t gnb 2> /dev/null; true
 EOF
 done
+sleep 3
+
+step "Stopping captures and collecting results in $OUTDIR"
+# the text summary keeps NGAP plus the SCTP association setup/teardown (no DATA, SACK or heartbeats)
+for host in $CN5G $CN5G2; do
+    on $host <<EOF
+tmux send-keys -t ngap C-c
+sleep 1
+sudo pkill -INT -x tcpdump
+sudo journalctl -u open5gs-amfd --since @$START --no-pager -o short-precise 2> /dev/null | sed 's/\x1b\[[0-9;]*m//g' > /tmp/amf.log
+sudo tshark -r /tmp/ngap.pcap -Y 'ngap || (sctp && !(sctp.chunk_type == 0 || sctp.chunk_type == 3 || sctp.chunk_type == 4 || sctp.chunk_type == 5))' 2> /dev/null > /tmp/ngap.txt
+true
+EOF
+done
+fetch() { scp -q -C $SSH_OPTS $SSH_USER@$1:$2 "$OUTDIR/$3" || echo "could not fetch $2 from $1"; }
+fetch $CN5G /tmp/ngap.pcap core1-ngap.pcap
+fetch $CN5G /tmp/ngap.txt core1-ngap.txt
+fetch $CN5G /tmp/amf.log core1-amf.log
+fetch $CN5G2 /tmp/ngap.pcap core2-ngap.pcap
+fetch $CN5G2 /tmp/ngap.txt core2-ngap.txt
+fetch $CN5G2 /tmp/amf.log core2-amf.log
+fetch $CUDU /tmp/gnb.log gnb1.log
+fetch $CUDU2 /tmp/gnb.log gnb2.log
+fetch $CUDU /tmp/meas.csv gnb1-meas.csv
+fetch $CUDU2 /tmp/meas.csv gnb2-meas.csv
+fetch $UE1 /tmp/ue-cell.txt ue1-serving-cell.txt
+fetch $UE1 /tmp/ping-ho.out ping-ho.out
+sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/gnb1.log" 2> /dev/null | grep -aE "trigger_n2|N2 HO|Handover|neighbour" > "$OUTDIR/gnb1-handover.txt"
 
 step "Summary"
 echo "gNB 1 refused the handover (unknown PCI, no relation):"
 grep -aE "could not find neighbour cell with PCI|no such neighbour in configuration" "$OUTDIR/gnb1.log" 2> /dev/null | sed 's/\x1b\[[0-9;]*m//g; s/^/    /' | tail -3
-echo "core 1 NGAP handover messages (expected none):"
-echo "    HandoverRequired seen: $(grep -c "HandoverRequired" "$OUTDIR/core1-ngap.txt" 2> /dev/null)"
+echo "NGAP handover messages (expected none: gNB 1 refuses before anything reaches a core):"
+for core in core1 core2; do
+    echo "    $core: $(grep -c NGAP "$OUTDIR/$core-ngap.txt" 2> /dev/null) NGAP packets, $(grep -ci "Handover" "$OUTDIR/$core-ngap.txt" 2> /dev/null) handover, $(grep -c "Nas=deregister" "$OUTDIR/$core-ngap.txt" 2> /dev/null) UE deregistration"
+done
+echo "measurement reports seen by gNB 1 (rows per reported cell):"
+tail -n +2 "$OUTDIR/gnb1-meas.csv" 2> /dev/null | awk -F, '{n[$4" PCI "$5]++; r[$4" PCI "$5]=$6} END {for (c in n) print "    " c ": " n[c] " samples, last RSRP " r[c] " dBm"}'
 echo "ue1 serving cell after the attempt (expect 999,99 PCI 1):"
 sed 's/^/    /' "$OUTDIR/ue1-serving-cell.txt" 2> /dev/null
 echo "ping: $(grep "packets transmitted" "$OUTDIR/ping-ho.out" 2> /dev/null || echo "see gnb1.log")"
