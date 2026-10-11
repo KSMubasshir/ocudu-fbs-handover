@@ -1,0 +1,58 @@
+#!/bin/bash
+# Summarise an FBS scenario dataset into summary.txt and summary.csv.
+#
+# Reads the per-scenario trace subdirectories written by run-fbs-exp (FBS
+# misbehaviour log, both AMF logs, the FBS core NGAP text) under a parent
+# directory and tabulates the outcome of each scenario. Reusable on its own:
+#     fbs-summary <parent dir> ["<scenarios>"]
+# With no scenario list it uses every subdirectory that has an fbs-amf.log.
+PARENT=$1
+SCENARIOS=$2
+
+[ -d "$PARENT" ] || { echo "usage: fbs-summary <parent dir> [\"<scenarios>\"]"; exit 1; }
+if [ -z "$SCENARIOS" ]; then
+    SCENARIOS=$(for d in "$PARENT"/*/; do [ -f "${d}fbs-amf.log" ] && basename "$d"; done)
+fi
+
+# number of lines matching a fixed pattern, 0 if the file is missing; grep -c
+# prints 0 and exits 1 on no match, so do not add a `|| echo 0` fallback (it
+# would print a second 0).
+cnt()  { if [ -f "$2" ]; then grep -ac  -- "$1" "$2"; else echo 0; fi; }
+icnt() { if [ -f "$2" ]; then grep -aci -- "$1" "$2"; else echo 0; fi; }
+
+SUM=$PARENT/summary.txt
+CSV=$PARENT/summary.csv
+echo "scenario,fbs_rrc_rejects,fbs_rrc_ignored,fbs_nas_dropped,fbs_registrations,fbs_ngap_reg_requests,home_registrations,outcome" > "$CSV"
+{
+    echo "FBS scenario dataset: $PARENT"
+    echo "generated $(date)"
+    echo
+    printf "%-9s %7s %7s %7s %6s %6s %7s  %s\n" scenario rrcRej rrcIgn nasDrop fbsReg fbsReq homeReg outcome
+    printf "%-9s %7s %7s %7s %6s %6s %7s  %s\n" --------- ------ ------ ------- ------ ------ ------- -------
+    for sc in $SCENARIOS; do
+        d=$PARENT/$sc
+        rej=$(cnt  "sending RRCReject"        "$d/fbs-misbehavior.txt")
+        ign=$(cnt  "ignoring RRCSetupRequest"  "$d/fbs-misbehavior.txt")
+        nas=$(cnt  "dropping UE"               "$d/fbs-misbehavior.txt")
+        freg=$(cnt "Registration complete"     "$d/fbs-amf.log")
+        freq=$(icnt "Registration request"     "$d/fbs-ngap.txt")
+        hreg=$(cnt "Registration complete"     "$d/home-amf.log")
+        if [ "$sc" = lure ]; then
+            [ "${freg:-0}" -gt 0 ] && out="lured: UE registered on the FBS core" || out="no lure (check $sc)"
+        else
+            denials=$((rej + ign + nas))
+            if [ "$denials" -gt 0 ] && [ "${freg:-0}" -eq 0 ]; then
+                out="DoS: UE denied service ${denials}x, 0 FBS registrations"
+            else
+                out="inconclusive (check $sc)"
+            fi
+        fi
+        printf "%-9s %7s %7s %7s %6s %6s %7s  %s\n" "$sc" "$rej" "$ign" "$nas" "$freg" "$freq" "$hreg" "$out"
+        echo "$sc,$rej,$ign,$nas,$freg,$freq,$hreg,\"$out\"" >> "$CSV"
+    done
+    echo
+    echo "per-scenario trace files: $PARENT/<scenario>/ (both cores' NGAP pcap+txt,"
+    echo "AMF logs, gNB logs, measurement CSVs, UE serving cell, FBS misbehaviour log)"
+} | tee "$SUM"
+echo
+echo "wrote $SUM and $CSV"

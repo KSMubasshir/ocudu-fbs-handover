@@ -1,0 +1,78 @@
+#!/bin/bash
+# Run the FBS scenarios in sequence and collect them into one dataset.
+#
+# Drives bin/run-fbs-exp once per scenario (lure, then the denial scenarios
+# reject/drop_rrc/drop_nas) into subdirectories of a single parent directory,
+# keeps each run's console output, and writes a combined summary (via
+# bin/fbs-summary: summary.txt and summary.csv) comparing the outcomes. Each run
+# restarts both gNBs, attaches ue1, raises the FBS, and restores the home cell
+# at the end, so the scenarios are independent and the testbed is left clean.
+# A scenario that fails (e.g. the UE does not attach) is retried once.
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+HOSTS_FILE=$REPO/hosts.env
+SCENARIOS="lure reject drop_rrc drop_nas"
+OUTDIR=""
+
+usage() {
+    cat <<EOF
+usage:
+    run-all-fbs-exp -h
+        show this help message
+    run-all-fbs-exp [-s "<scenarios>"] [-o <dir>] [-f <hosts file>]
+        -s  space-separated scenarios to run, in order
+            (default "$SCENARIOS")
+        -o  parent output directory (default traces/fbs-all-<date>-<time>)
+        -f  hosts file passed through to run-fbs-exp (default hosts.env)
+
+    Needs the same prerequisites as run-fbs-exp: OAI built on cudu/cudu2
+    (cudu2 with the FBS patch), Open5GS on cn5g and cn5g2.
+EOF
+}
+
+while getopts "hs:o:f:" opt; do
+    case $opt in
+        h) usage; exit 0 ;;
+        s) SCENARIOS=$OPTARG ;;
+        o) OUTDIR=$OPTARG ;;
+        f) HOSTS_FILE=$OPTARG ;;
+        *) usage; exit 1 ;;
+    esac
+done
+
+for sc in $SCENARIOS; do
+    case $sc in
+        lure|reject|drop_rrc|drop_nas) ;;
+        *) echo "invalid scenario: $sc"; usage; exit 1 ;;
+    esac
+done
+[ -f "$HOSTS_FILE" ] || { echo "$HOSTS_FILE not found"; exit 1; }
+
+OUTDIR=${OUTDIR:-$REPO/traces/fbs-all-$(date +%Y-%m-%d-%H%M%S)}
+mkdir -p "$OUTDIR" || { echo "cannot create $OUTDIR"; exit 1; }
+echo "collecting FBS scenarios [$SCENARIOS] into $OUTDIR"
+
+run_one() {
+    local sc=$1
+    "$REPO/bin/run-fbs-exp" -s "$sc" -o "$OUTDIR/$sc" -f "$HOSTS_FILE" 2>&1 | tee "$OUTDIR/$sc.console.log"
+    return ${PIPESTATUS[0]}
+}
+
+for sc in $SCENARIOS; do
+    echo
+    echo "################ scenario: $sc ################"
+    if run_one "$sc"; then
+        echo "$sc: done"
+    else
+        echo "$sc: failed (likely a flaky gNB start / UE attach); retrying once"
+        rm -rf "$OUTDIR/$sc"
+        if run_one "$sc"; then
+            echo "$sc: done on retry"
+        else
+            echo "$sc: FAILED again (see $OUTDIR/$sc.console.log); continuing"
+        fi
+    fi
+done
+
+# Combined summary parsed from each run's collected files (not the console),
+# so it reflects what landed on the wire and in the logs.
+"$REPO/bin/fbs-summary" "$OUTDIR" "$SCENARIOS"
