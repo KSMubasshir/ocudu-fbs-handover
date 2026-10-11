@@ -1,0 +1,41 @@
+diff --git a/openair2/RRC/NR/rrc_gNB.c b/openair2/RRC/NR/rrc_gNB.c
+index 13a375dfd5..7bcaefa910 100644
+--- a/openair2/RRC/NR/rrc_gNB.c
++++ b/openair2/RRC/NR/rrc_gNB.c
+@@ -724,6 +724,14 @@ static void rrc_gNB_process_RRCSetupComplete(gNB_RRC_INST *rrc, gNB_RRC_UE_t *UE
+   UE->Srb[1].Active = 1;
+   UE->Srb[2].Active = 0;
+ 
++  /* FBS (NIST CSWP 36G) scenario 3: complete RRC setup but never forward the
++   * UE's NAS Registration Request to the AMF, so registration stalls at the
++   * false base station. Selected by OAI_FBS_MODE=drop_nas on gNB 2. */
++  const char *fbs_mode = getenv("OAI_FBS_MODE");
++  if (fbs_mode && strcmp(fbs_mode, "drop_nas") == 0) {
++    LOG_A(NR_RRC, "FBS: dropping UE %04x NAS Registration Request (not forwarding to AMF, scenario 3)\n", UE->rnti);
++    return;
++  }
+   rrc_gNB_send_NGAP_NAS_FIRST_REQ(rrc, UE, rrcSetupComplete);
+ }
+ 
+@@ -1466,6 +1474,21 @@ static void rrc_handle_RRCSetupRequest(gNB_RRC_INST *rrc,
+   UE->ongoing_reconfiguration = false;
+   UE->measConfig = nr_rrc_get_measconfig(rrc, msg->nr_cellid, UE);
+   activate_srb(UE, 1);
++  /* FBS (NIST CSWP 36G): instead of serving the UE, misbehave as selected by
++   * the OAI_FBS_MODE environment variable (set on gNB 2, the false base
++   * station). "reject" = scenario 2 (RRCReject), "drop_rrc" = scenario 1
++   * (ignore the RRCSetupRequest). Any other value serves the UE normally. */
++  const char *fbs_mode = getenv("OAI_FBS_MODE");
++  if (fbs_mode && strcmp(fbs_mode, "reject") == 0) {
++    LOG_A(NR_RRC, "FBS: sending RRCReject to UE %04x (scenario 2)\n", msg->crnti);
++    rrc_gNB_generate_RRCReject(rrc, ue_context_p);
++    return;
++  }
++  if (fbs_mode && strcmp(fbs_mode, "drop_rrc") == 0) {
++    LOG_A(NR_RRC, "FBS: ignoring RRCSetupRequest from UE %04x (scenario 1)\n", msg->crnti);
++    rrc_remove_ue(rrc, ue_context_p);
++    return;
++  }
+   rrc_gNB_generate_RRCSetup(0, ue_context_p, msg->du2cu_rrc_container, msg->du2cu_rrc_container_length);
+ }
+ 

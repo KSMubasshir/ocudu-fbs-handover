@@ -3,13 +3,14 @@ BUILDDIR=/var/tmp/oai/cmake_targets/ran_build/build
 CFGDIR=/var/tmp/etc/oai
 TELNET_ADDR=127.0.0.1
 CLOCK=""
+FBS_MODE=""
 
 usage() {
     cat <<EOF2
 usage:
     start-oai-gnb -h
         show this help message
-    start-oai-gnb [-c internal|external]
+    start-oai-gnb [-c internal|external] [-m <fbs mode>]
         start the OAI gNB of this node in the foreground, picked from the
         node's 192.168.1.x address: gNB 1 -> core 1 on cudu, gNB 2 -> core 2
         on cudu2. Output is also written to /tmp/gnb.log.
@@ -17,13 +18,22 @@ usage:
             external: 10 MHz reference in. The time source stays internal on
             both radios: neither gets a PPS, and OAI waits forever for one
             when the time source is external.
+        -m  false base station misbehaviour for gNB 2 (NIST CSWP 36G), passed
+            to nr-softmodem as OAI_FBS_MODE (needs the patch in
+            patches/oai-fbs-misbehavior.patch, applied by deploy-oai.sh):
+              reject    scenario 2: answer RRCSetupRequest with RRCReject
+              drop_rrc  scenario 1: ignore the RRCSetupRequest
+              drop_nas  scenario 3: complete RRC but drop the NAS Registration
+                        Request (never forward it to the AMF)
+            Only meaningful on gNB 2 (the FBS); omit it for the home gNB.
 EOF2
 }
 
-while getopts "hc:" opt; do
+while getopts "hc:m:" opt; do
     case $opt in
         h) usage; exit 0 ;;
         c) CLOCK=$OPTARG ;;
+        m) FBS_MODE=$OPTARG ;;
         *) usage; exit 1 ;;
     esac
 done
@@ -31,6 +41,10 @@ done
 if [ -n "$CLOCK" ] && [ "$CLOCK" != "internal" ] && [ "$CLOCK" != "external" ]; then
     echo "invalid clock"; usage; exit 1
 fi
+case $FBS_MODE in
+    ""|reject|drop_rrc|drop_nas) ;;
+    *) echo "invalid fbs mode: $FBS_MODE"; usage; exit 1 ;;
+esac
 
 LANIP=$(ip -4 -o addr show | awk '{print $4}' | grep '^192\.168\.1\.' | cut -d/ -f1)
 case $LANIP in
@@ -79,11 +93,18 @@ fi
 
 echo "starting $NAME with $CFG"
 grep -n "clock_src\|time_src" $CFG
+# FBS misbehaviour mode for gNB 2, passed to nr-softmodem in its environment
+# (env survives sudo; the patched RRC reads OAI_FBS_MODE). Empty on the home gNB.
+FBS_ENV=""
+if [ -n "$FBS_MODE" ]; then
+    echo "FBS mode: $FBS_MODE (OAI_FBS_MODE)"
+    FBS_ENV="env OAI_FBS_MODE=$FBS_MODE"
+fi
 # nr-softmodem writes nrRRC_stats.log (connected UEs) to its working
 # directory. The telnet CI server is left enabled for manual inspection; it
 # is not needed on this branch (no handover).
 cd $BUILDDIR
-sudo $RUN ./nr-softmodem -O $CFG $RADIO_ARGS \
+sudo $RUN $FBS_ENV ./nr-softmodem -O $CFG $RADIO_ARGS \
     --gNBs.[0].min_rxtxtime 6 --usrp-tx-thread-config 1 \
     --telnetsrv --telnetsrv.shrmod ci --telnetsrv.listenaddr $TELNET_ADDR \
     2>&1 | sudo tee /tmp/gnb.log

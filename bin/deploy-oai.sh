@@ -31,6 +31,16 @@ git clone $OAI_REPO oai
 cd oai
 git checkout $COMMIT_HASH
 
+# FBS misbehaviour for gNB 2 (NIST CSWP 36G): patch the gNB RRC so OAI_FBS_MODE
+# selects how the false base station mistreats the UE (RRCReject / ignore RRC /
+# drop the NAS Registration Request). No-op when OAI_FBS_MODE is unset, so the
+# home gNB 1 built from the same tree behaves normally.
+PATCH=/local/repository/patches/oai-fbs-misbehavior.patch
+if [ -f $PATCH ]; then
+  echo "applying FBS patch $PATCH"
+  git apply --verbose $PATCH
+fi
+
 cd cmake_targets
 ./build_oai -I
 # telnetsrv is kept for manual gNB inspection (and the ci commands used by the

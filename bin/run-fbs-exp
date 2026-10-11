@@ -15,9 +15,18 @@
 # Captures both cores' NGAP from before the gNBs start, both AMF logs, both gNB
 # logs, each gNB's UE measurement reports and the UE serving cell over time
 # (home PCI 1/TAC 1 -> FBS PCI 3/TAC 2). Restores the home cell and returns the
-# UE to it at the end. The active-denial DoS variants in the white paper (FBS
-# sends RRCReject, ignores RRC/NAS, fakes/tampers NAS) require the FBS gNB/core
-# to misbehave and are not implemented here; this run is the lure they build on.
+# UE to it at the end.
+#
+# -s selects what the FBS does once the UE reaches it:
+#   lure      (default) the FBS accepts: the UE registers on core 2 (the lure).
+#   reject    scenario 2: the FBS answers RRCSetupRequest with RRCReject.
+#   drop_rrc  scenario 1: the FBS ignores the RRCSetupRequest.
+#   drop_nas  scenario 3: the FBS completes RRC but drops the NAS Registration
+#             Request (never forwards it to the AMF).
+# The denial scenarios need gNB 2 built with patches/oai-fbs-misbehavior.patch
+# (applied by deploy-oai.sh); the DoS shows as the UE reaching the FBS (PCI 3)
+# but never completing registration on core 2. Scenarios 4-6 (fake/tamper NAS)
+# need core-side changes and are not implemented here.
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 HOSTS_FILE=$REPO/hosts.env
 REMOTE_BIN=/local/repository/bin
@@ -28,30 +37,42 @@ FBS_STRONG=0     # gnb2ue1 attenuation once the FBS is turned on (min = stronges
 HOME_WEAK=40     # ru1ue1 attenuation once the FBS is on (home faded below FBS)
 SHIELD=95        # attenuation that keeps a cell off the UE
 OUTDIR=""
+SCENARIO=lure
 
 usage() {
     cat <<EOF
 usage:
     run-fbs-exp -h
         show this help message
-    run-fbs-exp [-o <dir>] [-f <hosts file>]
-        -o  local output directory (default traces/fbs-<date>-<time>)
+    run-fbs-exp [-s lure|reject|drop_rrc|drop_nas] [-o <dir>] [-f <hosts file>]
+        -s  what the FBS does once the UE reaches it (default lure):
+            lure = accept and register the UE on core 2; reject/drop_rrc/
+            drop_nas = white paper scenarios 2/1/3 (FBS denies service)
+        -o  local output directory (default traces/fbs-<scenario>-<date>-<time>)
         -f  hosts file setting SSH_USER, CN5G, CN5G2, CUDU, CUDU2, UE1
             (default hosts.env in the repo)
 
-    OAI must already be built on cudu and cudu2, and Open5GS installed on
-    cn5g (home) and cn5g2 (FBS core, same PLMN 999/99 but TAC 2).
+    OAI must already be built on cudu and cudu2 (cudu2 with the FBS patch for
+    the denial scenarios), and Open5GS installed on cn5g (home) and cn5g2 (FBS
+    core, same PLMN 999/99 but TAC 2).
 EOF
 }
 
-while getopts "ho:f:" opt; do
+while getopts "hs:o:f:" opt; do
     case $opt in
         h) usage; exit 0 ;;
+        s) SCENARIO=$OPTARG ;;
         o) OUTDIR=$OPTARG ;;
         f) HOSTS_FILE=$OPTARG ;;
         *) usage; exit 1 ;;
     esac
 done
+
+case $SCENARIO in
+    lure)     FBS_MODE="" ;;
+    reject|drop_rrc|drop_nas) FBS_MODE=$SCENARIO ;;
+    *) echo "invalid scenario: $SCENARIO"; usage; exit 1 ;;
+esac
 
 [ -f "$HOSTS_FILE" ] || { echo "$HOSTS_FILE not found"; usage; exit 1; }
 source "$HOSTS_FILE"
@@ -59,7 +80,7 @@ for var in SSH_USER CN5G CN5G2 CUDU CUDU2 UE1; do
     [ -n "${!var}" ] || { echo "$var is not set in $HOSTS_FILE"; exit 1; }
 done
 
-OUTDIR=${OUTDIR:-$REPO/traces/fbs-$(date +%Y-%m-%d-%H%M%S)}
+OUTDIR=${OUTDIR:-$REPO/traces/fbs-$SCENARIO-$(date +%Y-%m-%d-%H%M%S)}
 mkdir -p "$OUTDIR" || { echo "cannot create $OUTDIR"; exit 1; }
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15"
 
@@ -93,7 +114,9 @@ EOF
 }
 
 start_gnb() {
-    on $1 <<EOF
+    local host=$1 mode=$2 opt=""
+    [ -n "$mode" ] && opt=" -m $mode"
+    on $host <<EOF
 set -e
 [ -f /var/tmp/oai-setup-complete ] || { echo "\$(hostname -s): OAI is not built"; exit 1; }
 sudo pkill -INT -x nr-softmodem || true
@@ -101,7 +124,7 @@ for i in \$(seq 30); do pgrep -x nr-softmodem > /dev/null || break; sleep 1; don
 sudo pkill -KILL -x nr-softmodem || true
 tmux kill-session -t gnb 2> /dev/null || true
 sudo rm -f /tmp/gnb.log $OAI_BUILD/nrRRC_stats.log
-tmux new-session -d -s gnb -x 200 -y 50 $REMOTE_BIN/start-oai-gnb
+tmux new-session -d -s gnb -x 200 -y 50 "$REMOTE_BIN/start-oai-gnb$opt"
 EOF
 }
 wait_gnb() {
@@ -116,6 +139,8 @@ done
 echo "$(hostname -s): gNB did not start:"; tail -n 15 /tmp/gnb.log; exit 1
 EOF
 }
+
+echo "FBS scenario: $SCENARIO${FBS_MODE:+ (OAI_FBS_MODE=$FBS_MODE on gNB 2)}"
 
 step "Checking the nodes and installing scripts/configs"
 for host in $CN5G $CN5G2 $CUDU $CUDU2 $UE1; do
@@ -144,10 +169,10 @@ done
 START=$(on $CN5G <<< 'date +%s')
 
 step "Starting the home gNB (-> core 1) on cudu and the FBS gNB (-> core 2) on cudu2"
-start_gnb $CUDU & p1=$!
-start_gnb $CUDU2 & p2=$!
+start_gnb $CUDU "" & p1=$!
+start_gnb $CUDU2 "$FBS_MODE" & p2=$!
 wait $p1 || die "could not start the home gNB"
-wait $p2 || die "could not start the FBS gNB"
+wait $p2 || die "could not start the FBS gNB (scenario $SCENARIO)"
 wait_gnb $CUDU || die "home gNB is not running"
 wait_gnb $CUDU2 || die "FBS gNB is not running"
 for host in $CUDU $CUDU2; do
@@ -228,6 +253,7 @@ fetch $CUDU2 /tmp/gnb.log   fbs-gnb.log
 fetch $CUDU  /tmp/meas.csv  home-meas.csv
 fetch $CUDU2 /tmp/meas.csv  fbs-meas.csv
 fetch $UE1   /tmp/ue-cell.txt ue1-serving-cell.txt
+sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/fbs-gnb.log" 2> /dev/null | grep -aE "FBS:|RRCReject|RRCSetupRequest|RRCSetupComplete" > "$OUTDIR/fbs-misbehavior.txt"
 
 step "Restoring the home cell and returning ue1"
 on $CUDU <<EOF
@@ -246,11 +272,29 @@ tmux kill-session -t gnb 2> /dev/null; true
 EOF
 done
 
-step "Summary"
+step "Summary ($SCENARIO)"
 echo "idle UE reselected to the FBS (PCI $FBS_PCI): ${FBS_SEEN:-no (UE stayed on the home cell)}"
-echo "FBS core registration (the UE lured onto the attacker network):"
-grep -aE "Registration complete|InitialUEMessage|5G-S_GUTI" "$OUTDIR/fbs-amf.log" 2> /dev/null | sed 's/^/    /' | tail -4
-echo "FBS core NGAP (registration signalling, expected on the FBS core):"
+REG_DONE=$(grep -c "Registration complete" "$OUTDIR/fbs-amf.log" 2> /dev/null)
+if [ "$SCENARIO" = lure ]; then
+    echo "FBS core registration (the UE lured onto the attacker network):"
+    grep -aE "Registration complete|InitialUEMessage|5G-S_GUTI" "$OUTDIR/fbs-amf.log" 2> /dev/null | sed 's/^/    /' | tail -4
+    echo "    -> result: ${REG_DONE} registration(s) completed on the FBS core"
+else
+    # For denial scenarios the UE bounces back to the (faded) home cell right
+    # after each refusal, so QENG rarely catches it on the FBS; the DoS signal
+    # is the FBS repeatedly mistreating the UE's attempts while nothing reaches
+    # the FBS core.
+    DENIALS=$(grep -c "FBS:" "$OUTDIR/fbs-misbehavior.txt" 2> /dev/null)
+    echo "FBS denial ($SCENARIO) -- the UE attempts the FBS but gets no service:"
+    grep -aE "FBS:" "$OUTDIR/fbs-misbehavior.txt" 2> /dev/null | sed 's/^/    /' | tail -4
+    echo "    -> FBS mistreated the UE $DENIALS time(s); registrations completed on the FBS core = $REG_DONE"
+    if [ "${DENIALS:-0}" -gt 0 ] && [ "${REG_DONE:-0}" -eq 0 ]; then
+        echo "    -> DoS confirmed: the UE reached the FBS and was denied service every time"
+    else
+        echo "    -> inconclusive: check fbs-misbehavior.txt and fbs-amf.log"
+    fi
+fi
+echo "FBS core NGAP (registration signalling):"
 echo "    $(grep -c NGAP "$OUTDIR/fbs-ngap.txt" 2> /dev/null) NGAP packets, $(grep -ci "Registration request" "$OUTDIR/fbs-ngap.txt" 2> /dev/null) registration request"
 echo "UE measurement reports (rows per reported cell):"
 for who in home fbs; do
