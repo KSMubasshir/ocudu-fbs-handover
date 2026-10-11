@@ -1,16 +1,19 @@
 #!/bin/bash
 set -ex
-# deploy-open5gs.sh [<mcc> <mnc>]
+# deploy-open5gs.sh [<mcc> <mnc> [<tac>]]
 # Install Open5GS and provision the two subscribers. Without arguments this is
-# core 1 (cn5g, PLMN 999/99). With <mcc> <mnc> it is a second, independent core
-# on another node (cn5g2) broadcasting a different PLMN; give the digits exactly
-# as they appear in the PLMN, e.g. "001 01". NGAP and N3 GTP-U are bound to this
-# node's own 192.168.1.x address either way.
+# core 1 (cn5g, PLMN 999/99, TAC 1). With <mcc> <mnc> it is a second core on
+# another node (cn5g2); give the digits exactly as they appear in the PLMN,
+# e.g. "999 99". An optional <tac> sets the tracking area this core serves
+# (default 1); the FBS core (cn5g2) uses a different TAC than the home core so
+# the UE triggers mobility registration after idle reselection to the FBS.
+# NGAP and N3 GTP-U are bound to this node's own 192.168.1.x address either way.
 BINDIR=`dirname $0`
 source $BINDIR/common.sh
 
 MCC=${1:-999}
 MNC=${2:-99}
+TAC=${3:-1}
 LANIP=$(ip -4 -o addr show | awk '{print $4}' | grep '^192\.168\.1\.' | cut -d/ -f1)
 
 sudo sysctl -w net.ipv4.ip_forward=1
@@ -55,6 +58,9 @@ if [ -n "$LANIP" ]; then
     sudo sed -i "s/address: 192.168.1.1/address: $LANIP/" /etc/open5gs/amf.yaml /etc/open5gs/upf.yaml
 fi
 sudo sed -i -e "s/mcc: 999/mcc: $MCC/g" -e "s/mnc: 99/mnc: $MNC/g" /etc/open5gs/amf.yaml /etc/open5gs/nrf.yaml
+# Tracking area this core serves (amf.yaml tai). The gNB's tracking_area_code
+# must match, or NGSetup/registration is rejected.
+sudo sed -i -e "s/tac: 1/tac: $TAC/" /etc/open5gs/amf.yaml
 
 sudo systemctl restart open5gs-mmed
 sudo systemctl restart open5gs-sgwcd

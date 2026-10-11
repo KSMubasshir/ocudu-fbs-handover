@@ -17,11 +17,11 @@ This profile instantiates two independent OpenAirInterface (OAI) 5G networks on 
 The following will be deployed:
 - Open5GS core 1 (`cn5g`, Dell R430), PLMN 999/99 (home)
 - OAI gNB 1 (`cudu`, Dell R740 + USRP X310, daughter card A) -> core 1: gNB ID 411, PCI 1
-- Open5GS core 2 (`cn5g2`, Dell R430), PLMN 001/01 (foreign)
-- OAI gNB 2 (`cudu2`, Dell R740 + USRP N300) -> core 2: gNB ID 412, PCI 3
+- Open5GS core 2 (`cn5g2`, Dell R430), PLMN 999/99, TAC 2 (the FBS core)
+- OAI gNB 2 (`cudu2`, Dell R740 + USRP N300) -> core 2: gNB ID 412, PCI 3 (the false base station)
 - 2 Intel NUCs w/ Quectel RM520 COTS UEs
 
-Each gNB serves one 40 MHz (106 PRB, 30 kHz SCS) band 78 cell, on separate carriers: gNB 1 at 3619.2 MHz (SSB ARFCN 641280), gNB 2 at 3319.68 MHz (SSB ARFCN 621312), so a modem network scan lists gNB 2's cell as its own entry. The Quectel SIMs are homed on 999/99, so in SA the UE registers on gNB 1 (core 1) and does not register on gNB 2's foreign PLMN; gNB 2 is there to be seen/measured and to be driven from its own core.
+Each gNB serves one 40 MHz (106 PRB, 30 kHz SCS) band 78 cell. gNB 2 is the false base station: it clones gNB 1's carrier (3619.2 MHz, SSB ARFCN 641280) and PLMN (999/99) but keeps its own PCI (3) and broadcasts a different TAC (2) on its own core 2, which holds the same subscribers. With gNB 2 shielded the UE registers on gNB 1 (core 1); when gNB 2 out-powers gNB 1 at an idle UE, the UE reselects to the FBS intra-frequency and triggers mobility registration on core 2 (see `bin/run-fbs-exp`).
 
 #### Measurements and observation points
 
@@ -106,11 +106,16 @@ COMP_MANAGER_ID = "urn:publicid:IDN+emulab.net+authority+cm"
 DEFAULT_OAI_HASH = "f8f769592a7030be88ede4bb5ca66fa1ca6a80e0"
 OPEN5GS_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-open5gs.sh")
 OAI_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-oai.sh")
-# Foreign PLMN broadcast by gNB 2 and its own core (cn5g2). It must match
-# plmn_list in etc/oai/gnb2_n300_core2.conf. Given as separate MCC/MNC digit
-# strings so the leading zeros survive into the Open5GS config.
-FOREIGN_MCC = "001"
-FOREIGN_MNC = "01"
+# PLMN broadcast by gNB 2 and its own core (cn5g2): the same 999/99 as core 1,
+# a second, unconnected network of the same operator. It must match plmn_list
+# in etc/oai/gnb2_n300_core2.conf. Given as separate MCC/MNC digit strings so
+# leading zeros would survive into the Open5GS config.
+CORE2_MCC = "999"
+CORE2_MNC = "99"
+# The FBS core serves a different tracking area than the home core (TAC 1), so
+# the UE triggers mobility registration after idle-reselecting to the FBS. Must
+# match tracking_area_code in etc/oai/gnb2_n300_core2.conf.
+CORE2_TAC = "2"
 NODE_IDS = {
     "sdru": "x310-1",
     "sdru2": "n300-2",
@@ -204,9 +209,9 @@ cn_link.setNoBandwidthShaping()
 cn_link.addInterface(cn_if)
 cn_node.addService(pg.Execute(shell="bash", command=OPEN5GS_DEPLOY_SCRIPT))
 
-# Second, independent core for gNB 2: its own Open5GS broadcasting the foreign
-# PLMN. The deploy script binds NGAP and N3 to this node's 192.168.1.4 and
-# provisions subscribers under FOREIGN_MCC/FOREIGN_MNC.
+# Second, independent core for gNB 2: its own Open5GS broadcasting the same
+# PLMN as core 1. The deploy script binds NGAP and N3 to this node's 192.168.1.4 and
+# provisions subscribers under CORE2_MCC/CORE2_MNC.
 role = "cn5g2"
 cn2_node = request.RawPC(role)
 cn2_node.component_manager_id = COMP_MANAGER_ID
@@ -215,7 +220,7 @@ cn2_node.disk_image = UBUNTU_IMG
 cn2_if = cn2_node.addInterface("{}-if".format(role))
 cn2_if.addAddress(pg.IPv4Address("192.168.1.4", "255.255.255.0"))
 cn_link.addInterface(cn2_if)
-cn2_cmd = "{} {} {}".format(OPEN5GS_DEPLOY_SCRIPT, FOREIGN_MCC, FOREIGN_MNC)
+cn2_cmd = "{} {} {} {}".format(OPEN5GS_DEPLOY_SCRIPT, CORE2_MCC, CORE2_MNC, CORE2_TAC)
 cn2_node.addService(pg.Execute(shell="bash", command=cn2_cmd))
 
 # collect node objects for RF matrix

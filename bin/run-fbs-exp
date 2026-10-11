@@ -1,0 +1,260 @@
+#!/bin/bash
+# False Base Station idle-reselection experiment (NIST CSWP 36G) from your own
+# machine. gNB 2 (cudu2 -> core 2 cn5g2) is the FBS: it clones the home cell --
+# same PLMN 999/99 and same carrier (3.6192 GHz, ARFCN 641280) as gNB 1 (cudu ->
+# core 1 cn5g) -- with its own PCI 3 and a DIFFERENT TAC (2) on its own core.
+#
+# Flow (white paper scenario setup, steps 1-7): the UE registers on the home
+# network (gNB 1), goes idle, then the FBS out-powers gNB 1 at the UE. Being an
+# idle-mode, UE-autonomous procedure on the shared carrier, intra-frequency
+# reselection takes the UE to the FBS with no SIB4/measurement needed; finding a
+# new TAI, the UE performs mobility registration on the FBS's core 2. Core 2
+# holds the same subscribers, so the SIM homed on 999/99 registers on the
+# attacker's network -- the UE has been lured off the legitimate home network.
+#
+# Captures both cores' NGAP from before the gNBs start, both AMF logs, both gNB
+# logs, each gNB's UE measurement reports and the UE serving cell over time
+# (home PCI 1/TAC 1 -> FBS PCI 3/TAC 2). Restores the home cell and returns the
+# UE to it at the end. The active-denial DoS variants in the white paper (FBS
+# sends RRCReject, ignores RRC/NAS, fakes/tampers NAS) require the FBS gNB/core
+# to misbehave and are not implemented here; this run is the lure they build on.
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+HOSTS_FILE=$REPO/hosts.env
+REMOTE_BIN=/local/repository/bin
+OAI_BUILD=/var/tmp/oai/cmake_targets/ran_build/build
+HOME_PCI=1
+FBS_PCI=3
+FBS_STRONG=0     # gnb2ue1 attenuation once the FBS is turned on (min = strongest)
+HOME_WEAK=40     # ru1ue1 attenuation once the FBS is on (home faded below FBS)
+SHIELD=95        # attenuation that keeps a cell off the UE
+OUTDIR=""
+
+usage() {
+    cat <<EOF
+usage:
+    run-fbs-exp -h
+        show this help message
+    run-fbs-exp [-o <dir>] [-f <hosts file>]
+        -o  local output directory (default traces/fbs-<date>-<time>)
+        -f  hosts file setting SSH_USER, CN5G, CN5G2, CUDU, CUDU2, UE1
+            (default hosts.env in the repo)
+
+    OAI must already be built on cudu and cudu2, and Open5GS installed on
+    cn5g (home) and cn5g2 (FBS core, same PLMN 999/99 but TAC 2).
+EOF
+}
+
+while getopts "ho:f:" opt; do
+    case $opt in
+        h) usage; exit 0 ;;
+        o) OUTDIR=$OPTARG ;;
+        f) HOSTS_FILE=$OPTARG ;;
+        *) usage; exit 1 ;;
+    esac
+done
+
+[ -f "$HOSTS_FILE" ] || { echo "$HOSTS_FILE not found"; usage; exit 1; }
+source "$HOSTS_FILE"
+for var in SSH_USER CN5G CN5G2 CUDU CUDU2 UE1; do
+    [ -n "${!var}" ] || { echo "$var is not set in $HOSTS_FILE"; exit 1; }
+done
+
+OUTDIR=${OUTDIR:-$REPO/traces/fbs-$(date +%Y-%m-%d-%H%M%S)}
+mkdir -p "$OUTDIR" || { echo "cannot create $OUTDIR"; exit 1; }
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15"
+
+on() { ssh $SSH_OPTS $SSH_USER@$1 'bash -s'; }
+step() { echo; echo "== $*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+push() {
+    local host=$1; shift
+    ssh $SSH_OPTS $SSH_USER@$host 'mkdir -p /tmp/fbs-bin' || return 1
+    scp -q $SSH_OPTS "$@" $SSH_USER@$host:/tmp/fbs-bin/ || return 1
+    ssh $SSH_OPTS $SSH_USER@$host "sudo install -m 775 /tmp/fbs-bin/* $REMOTE_BIN/"
+}
+push_cfg() {
+    local host=$1; shift
+    ssh $SSH_OPTS $SSH_USER@$host 'mkdir -p /tmp/fbs-cfg' || return 1
+    scp -q $SSH_OPTS "$@" $SSH_USER@$host:/tmp/fbs-cfg/ || return 1
+    ssh $SSH_OPTS $SSH_USER@$host "sudo mkdir -p /var/tmp/etc/oai && sudo install -m 644 /tmp/fbs-cfg/* /var/tmp/etc/oai/"
+}
+
+# The Quectel returns the serving cell as +QENG: "servingcell",<state>,"NR5G-SA",
+# "TDD",<mcc>,<mnc>,<cellid hex>,<pci>,... Print just the PCI, or "" if unknown.
+ue_cell() {
+    on $UE1 <<'EOF'
+for n in 1 2 3; do
+    line=$(sudo sh -c 'chat -t 5 -sv "" AT OK "AT+QENG=\"servingcell\"" OK < /dev/ttyUSB2 > /dev/ttyUSB2' 2>&1 | grep -a "^+QENG" | tr -d '\r')
+    [ -n "$line" ] && { echo "$line"; break; }
+    sleep 2
+done
+EOF
+}
+
+start_gnb() {
+    on $1 <<EOF
+set -e
+[ -f /var/tmp/oai-setup-complete ] || { echo "\$(hostname -s): OAI is not built"; exit 1; }
+sudo pkill -INT -x nr-softmodem || true
+for i in \$(seq 30); do pgrep -x nr-softmodem > /dev/null || break; sleep 1; done
+sudo pkill -KILL -x nr-softmodem || true
+tmux kill-session -t gnb 2> /dev/null || true
+sudo rm -f /tmp/gnb.log $OAI_BUILD/nrRRC_stats.log
+tmux new-session -d -s gnb -x 200 -y 50 $REMOTE_BIN/start-oai-gnb
+EOF
+}
+wait_gnb() {
+    on $1 <<'EOF'
+for i in $(seq 120); do
+    if grep -aq "Received NGSetupResponse" /tmp/gnb.log 2> /dev/null && grep -aq "RF started" /tmp/gnb.log; then
+        echo "$(hostname -s): gNB started"; exit 0
+    fi
+    pgrep -x nr-softmodem > /dev/null || [ $i -lt 5 ] || break
+    sleep 2
+done
+echo "$(hostname -s): gNB did not start:"; tail -n 15 /tmp/gnb.log; exit 1
+EOF
+}
+
+step "Checking the nodes and installing scripts/configs"
+for host in $CN5G $CN5G2 $CUDU $CUDU2 $UE1; do
+    ssh $SSH_OPTS $SSH_USER@$host true || die "cannot reach $host; update $HOSTS_FILE"
+done
+for host in $CN5G $CN5G2; do
+    push $host "$REPO/bin/ngap-capture" || die "copy to $host failed"
+done
+for host in $CUDU $CUDU2; do
+    push $host "$REPO/bin/start-oai-gnb" "$REPO/bin/oai-meas-log.py" || die "copy to $host failed"
+done
+push_cfg $CUDU "$REPO/etc/oai/gnb1_x310_core1.conf" "$REPO/etc/oai/neighbour-config-measonly.conf" || die "config copy to $CUDU failed"
+push_cfg $CUDU2 "$REPO/etc/oai/gnb2_n300_core2.conf" || die "config copy to $CUDU2 failed"
+
+step "Capturing NGAP on the home core and the FBS core"
+for host in $CN5G $CN5G2; do
+    on $host <<EOF || die "could not start the NGAP capture on $host"
+tmux kill-session -t ngap 2> /dev/null
+sudo pkill -INT -x tcpdump
+sudo rm -f /tmp/ngap.pcap
+tmux new-session -d -s ngap '$REMOTE_BIN/ngap-capture /tmp/ngap.pcap'
+sleep 2
+pgrep -x tcpdump > /dev/null
+EOF
+done
+START=$(on $CN5G <<< 'date +%s')
+
+step "Starting the home gNB (-> core 1) on cudu and the FBS gNB (-> core 2) on cudu2"
+start_gnb $CUDU & p1=$!
+start_gnb $CUDU2 & p2=$!
+wait $p1 || die "could not start the home gNB"
+wait $p2 || die "could not start the FBS gNB"
+wait_gnb $CUDU || die "home gNB is not running"
+wait_gnb $CUDU2 || die "FBS gNB is not running"
+for host in $CUDU $CUDU2; do
+    on $host <<EOF || die "could not start the measurement log on $host"
+tmux kill-session -t meas 2> /dev/null; sudo rm -f /tmp/meas.csv
+tmux new-session -d -s meas 'sudo $REMOTE_BIN/oai-meas-log.py -o /tmp/meas.csv'
+EOF
+done
+
+step "Attaching ue1 to the home network (FBS shielded)"
+on $CUDU <<EOF || die "could not set attenuators"
+$REMOTE_BIN/update-attens ru1ue1 0
+$REMOTE_BIN/update-attens gnb2ue1 $SHIELD
+EOF
+on $UE1 <<EOF || die "ue1 did not get a data connection on the home network"
+pgrep -x quectel-CM > /dev/null || { tmux kill-session -t cm 2> /dev/null; tmux new-session -d -s cm 'sudo quectel-CM -s internet -4'; }
+$REMOTE_BIN/module-airplane.sh > /dev/null 2>&1
+sleep 3
+$REMOTE_BIN/module-on.sh > /dev/null 2>&1
+for i in \$(seq 45); do
+    ping -c 1 -W 1 10.45.0.1 > /dev/null 2>&1 && { echo "ue1 reaches the home data network"; exit 0; }
+    sleep 2
+done
+exit 1
+EOF
+echo "home serving cell: $(ue_cell)"
+
+step "Letting ue1 go idle on the home network"
+# No traffic for a while so the RRC connection is released; reselection is an
+# idle-mode procedure, so the UE must be idle before the FBS is raised.
+sleep 20
+IDLE_CELL=$(ue_cell)
+echo "idle serving cell (expect PCI $HOME_PCI): $IDLE_CELL"
+
+step "Turning on the FBS (out-powering the home cell at the idle UE)"
+on $CUDU <<EOF || die "could not set attenuators"
+$REMOTE_BIN/update-attens gnb2ue1 $FBS_STRONG
+$REMOTE_BIN/update-attens ru1ue1 $HOME_WEAK
+EOF
+
+step "Watching the idle UE reselect to the FBS"
+FBS_SEEN=""
+for i in $(seq 15); do
+    cell=$(ue_cell)
+    pci=$(echo "$cell" | awk -F, '{gsub(/ /,"",$8); print $8}')
+    echo "  [$i] $cell"
+    if [ "$pci" = "$FBS_PCI" ]; then FBS_SEEN=yes; fi
+    sleep 4
+done
+
+step "Stopping captures and collecting results in $OUTDIR"
+for host in $CUDU $CUDU2; do
+    on $host <<< 'tmux send-keys -t meas C-c 2> /dev/null; sleep 1; tmux kill-session -t meas 2> /dev/null; true'
+done
+on $UE1 <<'EOF'
+sudo sh -c 'chat -t 5 -sv "" AT OK "AT+QENG=\"servingcell\"" OK < /dev/ttyUSB2 > /dev/ttyUSB2' 2>&1 | grep -a "^+QENG" | tr -d '\r' > /tmp/ue-cell.txt
+cat /tmp/ue-cell.txt
+EOF
+for host in $CN5G $CN5G2; do
+    on $host <<EOF
+tmux send-keys -t ngap C-c
+sleep 1
+sudo pkill -INT -x tcpdump
+sudo journalctl -u open5gs-amfd --since @$START --no-pager -o short-precise 2> /dev/null | sed 's/\x1b\[[0-9;]*m//g' > /tmp/amf.log
+sudo tshark -r /tmp/ngap.pcap -Y 'ngap || (sctp && !(sctp.chunk_type == 0 || sctp.chunk_type == 3 || sctp.chunk_type == 4 || sctp.chunk_type == 5))' 2> /dev/null > /tmp/ngap.txt
+true
+EOF
+done
+fetch() { scp -q -C $SSH_OPTS $SSH_USER@$1:$2 "$OUTDIR/$3" || echo "could not fetch $2 from $1"; }
+fetch $CN5G  /tmp/ngap.pcap home-ngap.pcap
+fetch $CN5G  /tmp/ngap.txt  home-ngap.txt
+fetch $CN5G  /tmp/amf.log   home-amf.log
+fetch $CN5G2 /tmp/ngap.pcap fbs-ngap.pcap
+fetch $CN5G2 /tmp/ngap.txt  fbs-ngap.txt
+fetch $CN5G2 /tmp/amf.log   fbs-amf.log
+fetch $CUDU  /tmp/gnb.log   home-gnb.log
+fetch $CUDU2 /tmp/gnb.log   fbs-gnb.log
+fetch $CUDU  /tmp/meas.csv  home-meas.csv
+fetch $CUDU2 /tmp/meas.csv  fbs-meas.csv
+fetch $UE1   /tmp/ue-cell.txt ue1-serving-cell.txt
+
+step "Restoring the home cell and returning ue1"
+on $CUDU <<EOF
+$REMOTE_BIN/update-attens gnb2ue1 $SHIELD
+$REMOTE_BIN/update-attens ru1ue1 0
+EOF
+sleep 10
+echo "serving cell after restore (expect PCI $HOME_PCI): $(ue_cell)"
+
+step "Stopping both gNBs"
+for host in $CUDU $CUDU2; do
+    on $host <<'EOF'
+tmux send-keys -t gnb C-c 2> /dev/null; sleep 1
+sudo pkill -INT -x nr-softmodem; sleep 2; sudo pkill -KILL -x nr-softmodem
+tmux kill-session -t gnb 2> /dev/null; true
+EOF
+done
+
+step "Summary"
+echo "idle UE reselected to the FBS (PCI $FBS_PCI): ${FBS_SEEN:-no (UE stayed on the home cell)}"
+echo "FBS core registration (the UE lured onto the attacker network):"
+grep -aE "Registration complete|InitialUEMessage|5G-S_GUTI" "$OUTDIR/fbs-amf.log" 2> /dev/null | sed 's/^/    /' | tail -4
+echo "FBS core NGAP (registration signalling, expected on the FBS core):"
+echo "    $(grep -c NGAP "$OUTDIR/fbs-ngap.txt" 2> /dev/null) NGAP packets, $(grep -ci "Registration request" "$OUTDIR/fbs-ngap.txt" 2> /dev/null) registration request"
+echo "UE measurement reports (rows per reported cell):"
+for who in home fbs; do
+    tail -n +2 "$OUTDIR/$who-meas.csv" 2> /dev/null | awk -F, -v w=$who '{n[w" "$4" PCI "$5]++; r[w" "$4" PCI "$5]=$6} END {for (c in n) print "    " c ": " n[c] " samples, last RSRP " r[c] " dBm"}'
+done
+echo "ue1 final serving cell:"
+sed 's/^/    /' "$OUTDIR/ue1-serving-cell.txt" 2> /dev/null
