@@ -1,0 +1,85 @@
+#!/bin/bash
+# Start this node's OAI LTE eNB (lte-softmodem), the LTE twin of start-oai-gnb.
+# The node is picked from its 192.168.1.x address: enb1 (X310) -> EPC 1,
+# enb2 (N300, the FBS) -> EPC 2. Output is also written to /tmp/enb.log.
+BUILDDIR=/var/tmp/oai/cmake_targets/ran_build/build
+CFGDIR=/var/tmp/etc/oai
+FBS_MODE=""
+
+usage() {
+    cat <<EOF2
+usage:
+    start-oai-enb -h
+        show this help message
+    start-oai-enb [-m <fbs mode>]
+        start the OAI LTE eNB of this node in the foreground, picked from the
+        node's 192.168.1.x address: enb1 (X310) -> EPC 1 on 192.168.1.2,
+        enb2 (N300, the FBS) -> EPC 2 on 192.168.1.3. Output -> /tmp/enb.log.
+        -m  false base station misbehaviour for enb2, passed to lte-softmodem as
+            OAI_FBS_MODE (needs patches/oai-lte-fbs-misbehavior.patch applied by
+            deploy-oai-lte.sh): reject | drop_rrc | drop_nas. Only meaningful on
+            enb2; omit it for the home eNB.
+EOF2
+}
+
+while getopts "hm:" opt; do
+    case $opt in
+        h) usage; exit 0 ;;
+        m) FBS_MODE=$OPTARG ;;
+        *) usage; exit 1 ;;
+    esac
+done
+
+case $FBS_MODE in
+    ""|reject|drop_rrc|drop_nas) ;;
+    *) echo "invalid fbs mode: $FBS_MODE"; usage; exit 1 ;;
+esac
+
+LANIP=$(ip -4 -o addr show | awk '{print $4}' | grep '^192\.168\.1\.' | cut -d/ -f1)
+case $LANIP in
+    192.168.1.2)
+        NAME="eNB 1 (X310, home)"
+        CFG=$CFGDIR/enb1_x310_epc1.conf
+        RUN="numactl --membind 0 --cpubind 0"
+        RADIO_ARGS=""
+        ;;
+    192.168.1.3)
+        NAME="eNB 2 (N300, FBS)"
+        CFG=$CFGDIR/enb2_n300_epc2.conf
+        RUN=""
+        RADIO_ARGS=""
+        ;;
+    *)
+        echo "this node is neither enb1 (192.168.1.2) nor enb2 (192.168.1.3)"; exit 1
+        ;;
+esac
+
+if [ ! -x $BUILDDIR/lte-softmodem ] || [ ! -f $CFG ]; then
+    echo "$BUILDDIR/lte-softmodem or $CFG is missing; has deploy-oai-lte.sh finished?"; exit 1
+fi
+
+if pgrep -x lte-softmodem > /dev/null; then
+    echo "an lte-softmodem process is already running on this node; stop it first"; exit 1
+fi
+
+/local/repository/bin/tune-sdr-iface.sh > /dev/null
+
+# Match the 5G profile: keep the S1 interface MTU at 1500 (a 9000 MTU silently
+# drops oversized S1AP/GTP as jumbo frames).
+LANIF=$(ip -4 -o addr show | awk -v ip="$LANIP" '$4 ~ "^"ip"/" {print $2}')
+if [ "$(cat /sys/class/net/$LANIF/mtu)" -gt 1500 ]; then
+    echo "setting MTU of $LANIF ($LANIP) to 1500"
+    sudo ip link set $LANIF mtu 1500
+fi
+
+echo "starting $NAME with $CFG"
+# FBS misbehaviour mode for enb2, passed to lte-softmodem in its environment
+# (env survives sudo; a patched RRC would read OAI_FBS_MODE). Empty on the home
+# eNB and when the LTE FBS patch is not applied.
+FBS_ENV=""
+if [ -n "$FBS_MODE" ]; then
+    echo "FBS mode: $FBS_MODE (OAI_FBS_MODE)"
+    FBS_ENV="env OAI_FBS_MODE=$FBS_MODE"
+fi
+cd $BUILDDIR
+sudo $RUN $FBS_ENV ./lte-softmodem -O $CFG $RADIO_ARGS 2>&1 | sudo tee /tmp/enb.log
