@@ -122,22 +122,25 @@ sudo pkill -INT -x lte-softmodem || true
 for i in \$(seq 30); do pgrep -x lte-softmodem > /dev/null || break; sleep 1; done
 sudo pkill -KILL -x lte-softmodem || true
 tmux kill-session -t enb 2> /dev/null || true
+sleep 3  # let the USRP release its device claim before the new instance
 sudo rm -f /tmp/enb.log
 tmux new-session -d -s enb -x 200 -y 50 "$REMOTE_BIN/start-oai-enb$opt"
 EOF
 }
-# Wait for the eNB to complete S1 Setup with its MME and have the radio running.
-# OAI LTE markers vary by revision; adjust here if a build logs them differently.
+# Wait for the eNB radio to sync and S1 to connect to the MME. OAI's eNB logs no
+# S1-Setup-success string at default level, so readiness is judged from the cell
+# reaching "got sync" plus an ESTABLISHED SCTP association to the MME (port
+# 36412); S1 Setup completes reliably once that SCTP association is up.
 wait_enb() {
     on $1 <<'EOF'
 for i in $(seq 120); do
-    if grep -aiqE "S1 Setup Response|S1SETUPRESP|Received S1AP_S1SETUP" /tmp/enb.log 2> /dev/null; then
-        echo "$(hostname -s): eNB completed S1 setup"; exit 0
+    if grep -aq "got sync" /tmp/enb.log 2> /dev/null && ss -a --sctp 2> /dev/null | grep -qE "ESTAB.*:36412"; then
+        echo "$(hostname -s): eNB cell up and S1 connected to the MME"; exit 0
     fi
     pgrep -x lte-softmodem > /dev/null || [ $i -lt 5 ] || break
     sleep 2
 done
-echo "$(hostname -s): eNB did not complete S1 setup:"; tail -n 15 /tmp/enb.log; exit 1
+echo "$(hostname -s): eNB not ready (no sync or no S1 SCTP):"; tail -n 15 /tmp/enb.log; exit 1
 EOF
 }
 
