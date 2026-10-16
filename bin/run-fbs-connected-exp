@@ -1,0 +1,487 @@
+#!/bin/bash
+# False Base Station CONNECTED-mode experiment (NIST CSWP 36G companion to the
+# idle lure). Shows what the FBS can and cannot do to a UE that is RRC_CONNECTED
+# on the home network, rather than idle.
+#
+# Setup is identical to run-fbs-exp: gNB 2 (cudu2 -> core 2 cn5g2) is the FBS,
+# cloning the home cell (same PLMN 999/99, same carrier 641280 as gNB 1 on cudu
+# -> core 1 cn5g) with its own PCI 3 and a different TAC (2). gNB 2 runs in
+# ACCEPT mode here: it is willing to take the UE the moment the UE accesses it,
+# i.e. the FBS actively tries to grab the UE.
+#
+# Why connected mode is different from the idle lure: idle reselection is a
+# UE-autonomous procedure, so the FBS out-powering the home cell is enough to
+# move an idle UE. A connected UE does not choose its own cell -- handover is
+# commanded by the serving gNB. The FBS is on a separate core with no Xn/N2
+# neighbour relation to gNB 1 and no shared key material, so it can never be a
+# valid handover target, and it cannot forge an RRCReconfiguration the connected
+# UE would accept (dedicated DL RRC is addressed by the C-RNTI gNB 1 assigned
+# and integrity-protected with gNB 1's keys). So the FBS has no connected-mode
+# path to the UE.
+#
+# By default the run is phase 1 only and NEVER kills the home cell. Instead of
+# fading the home matrix path (which breaks the link and drops the UE to idle),
+# the home gNB's TX power is lowered in config (att_tx, -g dB) so the FBS, at
+# full power on the shared carrier, out-powers it while the home link stays clean
+# enough to carry traffic and hold the RRC connection. A steady iperf3 downlink
+# pins the UE in RRC_CONNECTED, verified (QENG state=CONN) before the FBS rises.
+#   Phase 1 (FBS stronger, home link clean): the connected UE keeps live traffic
+#     and STAYS on the home cell (PCI 1) even though the FBS is the stronger
+#     signal -- a connected UE cannot act on a better cell, and gNB 1 has no
+#     neighbour relation to hand it to the FBS. Nothing reaches the FBS. This is
+#     the result: a connected UE does not follow a stronger FBS. (Because the FBS
+#     clones the home carrier, too large a -g lets its co-channel interference
+#     break the home link, dropping the UE to idle -- see the summary's hints.)
+#   Phase 2 (opt-in with -K, kills the home cell): the UE loses its serving link,
+#     suffers a radio link failure, drops to idle, and only THEN re-accesses the
+#     strongest cell -- the FBS -- and registers on core 2. That is a connection
+#     drop + fresh registration, NOT a handover: the connected-mode procedure
+#     gave the FBS no way in; the FBS had to knock the UE offline first, after
+#     which the idle lure applies. Off unless -K is given.
+#
+# Captures both cores' NGAP from before the gNBs start, both AMF logs, both gNB
+# logs (home gNB's RRC events: measurement reports, handover attempts, RLF,
+# re-establishment), the home gNB RRC stats (proof the UE was connected), each
+# gNB's UE measurement reports, the UE serving cell over time and the UE's data
+# reachability (ping) across both phases. Restores the home cell and returns the
+# UE to it at the end.
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+HOSTS_FILE=$REPO/hosts.env
+REMOTE_BIN=/local/repository/bin
+OAI_BUILD=/var/tmp/oai/cmake_targets/ran_build/build
+HOME_PCI=1
+FBS_PCI=3
+FBS_STRONG=0      # gnb2ue1 attenuation once the FBS is on (min = strongest)
+HOME_TXATT=6      # dB subtracted from the home gNB TX power in config (att_tx):
+                  # trims the home cell so the FBS out-powers it WITHOUT fading
+                  # the home matrix path, so the home link stays clean enough to
+                  # carry traffic and hold the RRC connection
+HOME_SOFT=25      # ru1ue1 in phase 2 fallback (unused in the default TX-gain run)
+HOME_KILL=95      # ru1ue1 in phase 2: home cell taken off the UE (force RLF)
+SHIELD=95         # attenuation that keeps a cell off the UE
+PHASE1=40         # seconds to hold phase 1 (connected UE, FBS stronger)
+PHASE2=40         # seconds to hold phase 2 (home killed, RLF -> re-register)
+DO_PHASE2=0       # the RLF phase (kill the home cell) is opt-in via -K
+SCENARIO=accept
+OUTDIR=""
+
+usage() {
+    cat <<EOF
+usage:
+    run-fbs-connected-exp -h
+        show this help message
+    run-fbs-connected-exp [-s accept|reject|drop_rrc|drop_nas] [-1 <sec>]
+                          [-K [-2 <sec>]] [-o <dir>] [-f <hosts file>]
+        -s  what the FBS does if the UE ever reaches it (default accept): accept
+            = take the UE (the FBS actively grabs it); reject/drop_rrc/drop_nas =
+            deny it (white paper scenarios 2/1/3, needs the FBS patch on gNB 2)
+        -g  dB to lower the home gNB TX power in config (att_tx), so the FBS
+            out-powers the home cell while the home radio link stays clean
+            enough to keep the UE connected (default $HOME_TXATT; 0 = unchanged)
+        -1  seconds to hold phase 1, FBS stronger but home still usable, UE
+            connected with traffic (default $PHASE1)
+        -K  also run phase 2: KILL the home cell to force a radio link failure
+            and show the UE drop to idle and re-register on the FBS. Off by
+            default -- a normal run never touches the home cell, it only fades
+            it below the FBS, so gNB 1 keeps serving ue1 throughout.
+        -2  seconds to hold phase 2 when -K is given (default $PHASE2)
+        -o  local output directory (default traces/fbs-connected-<date>-<time>)
+        -f  hosts file setting SSH_USER, CN5G, CN5G2, CUDU, CUDU2, UE1
+            (default hosts.env in the repo)
+
+    OAI must already be built on cudu and cudu2 (cudu2 with the FBS patch for
+    the denial scenarios), and Open5GS installed on cn5g (home) and cn5g2 (FBS
+    core, same PLMN 999/99 but TAC 2).
+EOF
+}
+
+while getopts "hs:g:1:2:Ko:f:" opt; do
+    case $opt in
+        h) usage; exit 0 ;;
+        s) SCENARIO=$OPTARG ;;
+        g) HOME_TXATT=$OPTARG ;;
+        1) PHASE1=$OPTARG ;;
+        2) PHASE2=$OPTARG ;;
+        K) DO_PHASE2=1 ;;
+        o) OUTDIR=$OPTARG ;;
+        f) HOSTS_FILE=$OPTARG ;;
+        *) usage; exit 1 ;;
+    esac
+done
+
+case $SCENARIO in
+    accept)   FBS_MODE="" ;;
+    reject|drop_rrc|drop_nas) FBS_MODE=$SCENARIO ;;
+    *) echo "invalid scenario: $SCENARIO"; usage; exit 1 ;;
+esac
+for v in PHASE1 PHASE2; do
+    [[ ${!v} =~ ^[1-9][0-9]*$ ]] || { echo "invalid -${v#PHASE}"; usage; exit 1; }
+done
+[[ $HOME_TXATT =~ ^[0-9]+$ ]] || { echo "invalid -g (dB, integer >= 0)"; usage; exit 1; }
+
+[ -f "$HOSTS_FILE" ] || { echo "$HOSTS_FILE not found"; usage; exit 1; }
+source "$HOSTS_FILE"
+for var in SSH_USER CN5G CN5G2 CUDU CUDU2 UE1; do
+    [ -n "${!var}" ] || { echo "$var is not set in $HOSTS_FILE"; exit 1; }
+done
+
+OUTDIR=${OUTDIR:-$REPO/traces/fbs-connected-$(date +%Y-%m-%d-%H%M%S)}
+mkdir -p "$OUTDIR" || { echo "cannot create $OUTDIR"; exit 1; }
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15"
+
+on() { ssh $SSH_OPTS $SSH_USER@$1 'bash -s'; }
+step() { echo; echo "== $*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+push() {
+    local host=$1; shift
+    ssh $SSH_OPTS $SSH_USER@$host 'mkdir -p /tmp/fbs-bin' || return 1
+    scp -q $SSH_OPTS "$@" $SSH_USER@$host:/tmp/fbs-bin/ || return 1
+    ssh $SSH_OPTS $SSH_USER@$host "sudo install -m 775 /tmp/fbs-bin/* $REMOTE_BIN/"
+}
+push_cfg() {
+    local host=$1; shift
+    ssh $SSH_OPTS $SSH_USER@$host 'mkdir -p /tmp/fbs-cfg' || return 1
+    scp -q $SSH_OPTS "$@" $SSH_USER@$host:/tmp/fbs-cfg/ || return 1
+    ssh $SSH_OPTS $SSH_USER@$host "sudo mkdir -p /var/tmp/etc/oai && sudo install -m 644 /tmp/fbs-cfg/* /var/tmp/etc/oai/"
+}
+
+# The Quectel returns the serving cell as +QENG: "servingcell",<state>,"NR5G-SA",
+# "TDD",<mcc>,<mnc>,<cellid hex>,<pci>,... Print the whole line, or "" if unknown.
+ue_cell() {
+    on $UE1 <<'EOF'
+for n in 1 2 3; do
+    line=$(sudo sh -c 'chat -t 5 -sv "" AT OK "AT+QENG=\"servingcell\"" OK < /dev/ttyUSB2 > /dev/ttyUSB2' 2>&1 | grep -a "^+QENG" | tr -d '\r')
+    [ -n "$line" ] && { echo "$line"; break; }
+    sleep 2
+done
+EOF
+}
+# PCI field of the +QENG serving-cell line (8th comma-separated field).
+ue_pci() { echo "$1" | awk -F, '{gsub(/ /,"",$8); print $8}'; }
+# Is the UE's data path up right now? prints up/down.
+ue_ping() {
+    on $UE1 <<'EOF'
+ping -c 1 -W 1 10.45.0.1 > /dev/null 2>&1 && echo up || echo down
+EOF
+}
+
+start_gnb() {
+    local host=$1 mode=$2 opt=""
+    [ -n "$mode" ] && opt=" -m $mode"
+    on $host <<EOF
+set -e
+[ -f /var/tmp/oai-setup-complete ] || { echo "\$(hostname -s): OAI is not built"; exit 1; }
+sudo pkill -INT -x nr-softmodem || true
+for i in \$(seq 30); do pgrep -x nr-softmodem > /dev/null || break; sleep 1; done
+sudo pkill -KILL -x nr-softmodem || true
+tmux kill-session -t gnb 2> /dev/null || true
+sudo rm -f /tmp/gnb.log $OAI_BUILD/nrRRC_stats.log
+tmux new-session -d -s gnb -x 200 -y 50 "$REMOTE_BIN/start-oai-gnb$opt"
+EOF
+}
+wait_gnb() {
+    on $1 <<'EOF'
+for i in $(seq 120); do
+    if grep -aq "Received NGSetupResponse" /tmp/gnb.log 2> /dev/null && grep -aq "RF started" /tmp/gnb.log; then
+        echo "$(hostname -s): gNB started"; exit 0
+    fi
+    pgrep -x nr-softmodem > /dev/null || [ $i -lt 5 ] || break
+    sleep 2
+done
+echo "$(hostname -s): gNB did not start:"; tail -n 15 /tmp/gnb.log; exit 1
+EOF
+}
+# Is the UE present as a connected UE in the home gNB's RRC stats? prints the
+# count of distinct CU UE IDs (0 = not connected / idle).
+home_connected() {
+    on $CUDU <<EOF
+sudo grep -o "CU UE ID [0-9]*" $OAI_BUILD/nrRRC_stats.log 2> /dev/null | sort -u | wc -l
+EOF
+}
+
+echo "FBS connected-mode scenario: $SCENARIO${FBS_MODE:+ (OAI_FBS_MODE=$FBS_MODE on gNB 2)}"
+echo "home gNB TX lowered by ${HOME_TXATT} dB (att_tx) so the FBS out-powers it; home matrix path kept at 0"
+echo "phase 1 ${PHASE1}s (FBS stronger, home usable)$([ $DO_PHASE2 = 1 ] && echo ", phase 2 ${PHASE2}s (home KILLED -> RLF, -K)" || echo " only; home cell kept up")"
+
+step "Checking the nodes and installing scripts/configs"
+for host in $CN5G $CN5G2 $CUDU $CUDU2 $UE1; do
+    ssh $SSH_OPTS $SSH_USER@$host true || die "cannot reach $host; update $HOSTS_FILE"
+done
+for host in $CN5G $CN5G2; do
+    push $host "$REPO/bin/ngap-capture" || die "copy to $host failed"
+done
+for host in $CUDU $CUDU2; do
+    push $host "$REPO/bin/start-oai-gnb" "$REPO/bin/oai-meas-log.py" || die "copy to $host failed"
+done
+push_cfg $CUDU "$REPO/etc/oai/gnb1_x310_core1.conf" "$REPO/etc/oai/neighbour-config-measonly.conf" || die "config copy to $CUDU failed"
+push_cfg $CUDU2 "$REPO/etc/oai/gnb2_n300_core2.conf" || die "config copy to $CUDU2 failed"
+
+# Lower the home gNB TX power in its pushed config (att_tx), so the FBS can
+# out-power the home cell without fading the home matrix path. Editing only the
+# copy on the node, not the repo config.
+if [ "$HOME_TXATT" -gt 0 ]; then
+    on $CUDU <<EOF || die "could not set home att_tx on $CUDU"
+sudo sed -i 's/^\( *att_tx *=\).*/\1 $HOME_TXATT;/' /var/tmp/etc/oai/gnb1_x310_core1.conf
+echo "home gNB att_tx set to: \$(grep -E '^ *att_tx' /var/tmp/etc/oai/gnb1_x310_core1.conf | tr -d ' ')"
+EOF
+fi
+
+step "Capturing NGAP on the home core and the FBS core"
+for host in $CN5G $CN5G2; do
+    on $host <<EOF || die "could not start the NGAP capture on $host"
+tmux kill-session -t ngap 2> /dev/null
+sudo pkill -INT -x tcpdump
+sudo rm -f /tmp/ngap.pcap
+tmux new-session -d -s ngap '$REMOTE_BIN/ngap-capture /tmp/ngap.pcap'
+sleep 2
+pgrep -x tcpdump > /dev/null
+EOF
+done
+START=$(on $CN5G <<< 'date +%s')
+
+step "Starting the home gNB (-> core 1) on cudu and the FBS gNB (-> core 2) on cudu2"
+start_gnb $CUDU "" & p1=$!
+start_gnb $CUDU2 "$FBS_MODE" & p2=$!
+wait $p1 || die "could not start the home gNB"
+wait $p2 || die "could not start the FBS gNB"
+wait_gnb $CUDU || die "home gNB is not running"
+wait_gnb $CUDU2 || die "FBS gNB is not running"
+for host in $CUDU $CUDU2; do
+    on $host <<EOF || die "could not start the measurement log on $host"
+tmux kill-session -t meas 2> /dev/null; sudo rm -f /tmp/meas.csv
+tmux new-session -d -s meas 'sudo $REMOTE_BIN/oai-meas-log.py -o /tmp/meas.csv'
+EOF
+done
+
+step "Attaching ue1 to the home network (FBS shielded)"
+on $CUDU <<EOF || die "could not set attenuators"
+$REMOTE_BIN/update-attens ru1ue1 0
+$REMOTE_BIN/update-attens gnb2ue1 $SHIELD
+EOF
+on $UE1 <<EOF || die "ue1 did not get a data connection on the home network"
+pgrep -x quectel-CM > /dev/null || { tmux kill-session -t cm 2> /dev/null; tmux new-session -d -s cm 'sudo quectel-CM -s internet -4'; }
+$REMOTE_BIN/module-airplane.sh > /dev/null 2>&1
+sleep 3
+$REMOTE_BIN/module-on.sh > /dev/null 2>&1
+for i in \$(seq 45); do
+    ping -c 1 -W 1 10.45.0.1 > /dev/null 2>&1 && { echo "ue1 reaches the home data network"; exit 0; }
+    sleep 2
+done
+exit 1
+EOF
+echo "home serving cell: $(ue_cell)"
+
+step "Starting a steady iperf3 downlink to hold ue1 in RRC_CONNECTED"
+# A light ping lets the gNB suspend the UE to RRC_INACTIVE (QENG shows NOCONN).
+# A continuous downlink forces the UE to stay in RRC_CONNECTED to receive it.
+# iperf3 server on the UE, client on the core (downlink UE <- core through the
+# UPF). Rate kept modest so it is not throughput-bound, just connection-holding.
+UE_IP=$(on $UE1 <<'EOF'
+ip -4 addr show 2>/dev/null | awk '/inet 10\.45\./{print $2}' | cut -d/ -f1 | head -1
+EOF
+)
+[ -n "$UE_IP" ] || die "could not read ue1 data IP (is the PDU session up?)"
+echo "ue1 data IP: $UE_IP"
+on $UE1 <<'EOF'
+sudo pkill -x iperf3 2> /dev/null; sleep 1
+nohup iperf3 -s > /tmp/iperf3-server.log 2>&1 &
+sleep 1
+pgrep -x iperf3 > /dev/null && echo "iperf3 server up on ue1" || echo "iperf3 server did NOT start"
+EOF
+on $CN5G <<EOF
+sudo pkill -x iperf3 2> /dev/null; sleep 1
+# Client on the core sends to the server on the UE = downlink to the UE (no -R).
+# Runs for the whole connected window (attach check + phase 1, plus margin).
+nohup iperf3 -c $UE_IP -u -b 4M -t $((PHASE1 + 40)) > /tmp/iperf3-dl.log 2>&1 &
+sleep 3
+pgrep -x iperf3 > /dev/null && echo "iperf3 downlink running from the core" || { echo "iperf3 downlink did NOT start:"; tail -3 /tmp/iperf3-dl.log 2> /dev/null; }
+EOF
+sleep 5
+CONN_BEFORE=$(home_connected)
+CELL_CONN=$(ue_cell)
+STATE_CONN=$(echo "$CELL_CONN" | awk -F, '{gsub(/[" ]/,"",$2); print $2}')
+echo "connected UEs in home gNB RRC stats (expect >=1): ${CONN_BEFORE:-?}"
+echo "ue1 RRC state before raising the FBS (expect CONN): ${STATE_CONN:-?}  [$CELL_CONN]"
+if [ "$STATE_CONN" != CONN ]; then
+    echo "WARNING: ue1 is not RRC_CONNECTED ($STATE_CONN) before the FBS is raised;"
+    echo "         the connected-mode test needs CONN here. Raising the FBS anyway so"
+    echo "         the trace records the behaviour, but treat the result with care."
+fi
+
+step "PHASE 1: raising the FBS above the (TX-trimmed) home cell, UE stays connected (${PHASE1}s)"
+# The home matrix path stays at 0 (clean link); the home cell was already
+# trimmed by att_tx so the FBS, raised to full power here, is the stronger cell
+# at the UE. A connected UE has no autonomous way to leave its serving cell, and
+# the network has no neighbour relation to hand it to the FBS, so it should stay.
+on $CUDU <<EOF || die "could not set attenuators"
+$REMOTE_BIN/update-attens gnb2ue1 $FBS_STRONG
+$REMOTE_BIN/update-attens ru1ue1 0
+EOF
+P1_MOVED=""; P1_UP=0; P1_TOT=0; P1_RRCCONN=0
+for i in $(seq $((PHASE1/4))); do
+    cell=$(ue_cell); pci=$(ue_pci "$cell"); reach=$(ue_ping)
+    state=$(echo "$cell" | awk -F, '{gsub(/[" ]/,"",$2); print $2}')
+    [ "$reach" = up ] && P1_UP=$((P1_UP+1)); P1_TOT=$((P1_TOT+1))
+    [ "$state" = CONN ] && P1_RRCCONN=$((P1_RRCCONN+1))
+    echo "  [p1 $i] PCI ${pci:-?} rrc=${state:-?} data=$reach"
+    [ "$pci" = "$FBS_PCI" ] && P1_MOVED=yes
+    sleep 4
+done
+P1_CONN=$(home_connected)
+echo "  connected UEs in home gNB RRC stats after phase 1 (expect >=1): ${P1_CONN:-?}"
+
+if [ "$DO_PHASE2" = 1 ]; then
+    step "PHASE 2: killing the home cell to force a radio link failure (${PHASE2}s)"
+    # Only by removing the serving link do we make the connected UE leave: it
+    # suffers RLF, drops to idle, and re-accesses the strongest cell (the FBS).
+    # This is a connection drop + fresh registration, not a handover.
+    on $CUDU <<EOF || die "could not set attenuators"
+$REMOTE_BIN/update-attens ru1ue1 $HOME_KILL
+$REMOTE_BIN/update-attens gnb2ue1 $FBS_STRONG
+EOF
+    P2_FBS=""; P2_UP=0; P2_TOT=0
+    for i in $(seq $((PHASE2/4))); do
+        cell=$(ue_cell); pci=$(ue_pci "$cell"); reach=$(ue_ping)
+        [ "$reach" = up ] && P2_UP=$((P2_UP+1)); P2_TOT=$((P2_TOT+1))
+        echo "  [p2 $i] PCI ${pci:-?} data=$reach"
+        [ "$pci" = "$FBS_PCI" ] && P2_FBS=yes
+        sleep 4
+    done
+fi
+
+step "Stopping captures and collecting results in $OUTDIR"
+on $CN5G <<< 'sudo pkill -x iperf3 2> /dev/null; true'
+on $UE1 <<'EOF'
+sudo pkill -x iperf3 2> /dev/null; sleep 1
+sudo sh -c 'chat -t 5 -sv "" AT OK "AT+QENG=\"servingcell\"" OK < /dev/ttyUSB2 > /dev/ttyUSB2' 2>&1 | grep -a "^+QENG" | tr -d '\r' > /tmp/ue-cell.txt
+cat /tmp/ue-cell.txt
+EOF
+for host in $CUDU $CUDU2; do
+    on $host <<< 'tmux send-keys -t meas C-c 2> /dev/null; sleep 1; tmux kill-session -t meas 2> /dev/null; true'
+done
+# Snapshot the home gNB RRC stats before stopping (proof the UE was connected).
+on $CUDU <<EOF
+sudo cp $OAI_BUILD/nrRRC_stats.log /tmp/home-rrc-stats.log 2> /dev/null; true
+EOF
+for host in $CN5G $CN5G2; do
+    on $host <<EOF
+tmux send-keys -t ngap C-c
+sleep 1
+sudo pkill -INT -x tcpdump
+sudo journalctl -u open5gs-amfd --since @$START --no-pager -o short-precise 2> /dev/null | sed 's/\x1b\[[0-9;]*m//g' > /tmp/amf.log
+sudo tshark -r /tmp/ngap.pcap -Y 'ngap || (sctp && !(sctp.chunk_type == 0 || sctp.chunk_type == 3 || sctp.chunk_type == 4 || sctp.chunk_type == 5))' 2> /dev/null > /tmp/ngap.txt
+true
+EOF
+done
+fetch() { scp -q -C $SSH_OPTS $SSH_USER@$1:$2 "$OUTDIR/$3" || echo "could not fetch $2 from $1"; }
+fetch $CN5G  /tmp/ngap.pcap home-ngap.pcap
+fetch $CN5G  /tmp/ngap.txt  home-ngap.txt
+fetch $CN5G  /tmp/amf.log   home-amf.log
+fetch $CN5G2 /tmp/ngap.pcap fbs-ngap.pcap
+fetch $CN5G2 /tmp/ngap.txt  fbs-ngap.txt
+fetch $CN5G2 /tmp/amf.log   fbs-amf.log
+fetch $CUDU  /tmp/gnb.log   home-gnb.log
+fetch $CUDU2 /tmp/gnb.log   fbs-gnb.log
+fetch $CUDU  /tmp/meas.csv  home-meas.csv
+fetch $CUDU2 /tmp/meas.csv  fbs-meas.csv
+fetch $CUDU  /tmp/home-rrc-stats.log home-rrc-stats.log
+fetch $UE1   /tmp/ue-cell.txt ue1-serving-cell.txt
+fetch $CN5G  /tmp/iperf3-dl.log iperf3-downlink.log
+fetch $UE1   /tmp/iperf3-server.log iperf3-server.log
+# Home gNB connected-mode RRC events: measurement reports, handover attempts,
+# unknown-neighbour refusals, radio link failure, re-establishment.
+sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/home-gnb.log" 2> /dev/null \
+    | grep -aiE "measurement report|measurementReport|handover|HandoverPreparation|neighbour|neighbor|no CU found|rrcReconfiguration|reestablish|RLF|radio link|removing UE|UE context release|Detected" \
+    > "$OUTDIR/home-rrc-events.txt"
+# FBS side: any UE access reaching the false base station (only expected after
+# the phase 2 RLF, as a fresh attach -- never as a handover).
+sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/fbs-gnb.log" 2> /dev/null \
+    | grep -aiE "FBS:|RRCSetupRequest|RRCSetupComplete|RRCReject|HandoverRequest|reestablish" \
+    > "$OUTDIR/fbs-access.txt"
+
+step "Restoring the home cell and returning ue1"
+on $CUDU <<EOF
+$REMOTE_BIN/update-attens gnb2ue1 $SHIELD
+$REMOTE_BIN/update-attens ru1ue1 0
+EOF
+sleep 10
+echo "serving cell after restore (expect PCI $HOME_PCI): $(ue_cell)"
+
+step "Stopping both gNBs"
+for host in $CUDU $CUDU2; do
+    on $host <<'EOF'
+tmux send-keys -t gnb C-c 2> /dev/null; sleep 1
+sudo pkill -INT -x nr-softmodem; sleep 2; sudo pkill -KILL -x nr-softmodem
+tmux kill-session -t gnb 2> /dev/null; true
+EOF
+done
+
+step "Summary (connected-mode, $SCENARIO)"
+HOME_REG=$(grep -c "Registration complete" "$OUTDIR/home-amf.log" 2> /dev/null)
+FBS_REG=$(grep -c "Registration complete" "$OUTDIR/fbs-amf.log" 2> /dev/null)
+FBS_ACCESS=$(grep -acE "RRCSetupRequest|FBS:|HandoverRequest" "$OUTDIR/fbs-access.txt" 2> /dev/null)
+HO_ATTEMPT=$(grep -aciE "handover|HandoverPreparation" "$OUTDIR/home-rrc-events.txt" 2> /dev/null)
+# Authoritative connected-state evidence (the Quectel QENG servingcell "state"
+# field reads NOCONN even while actively connected, so it is NOT reliable here):
+#  - the home gNB logs measurements ONLY for RRC_CONNECTED UEs, so continuous
+#    "serving" rows on the home PCI mean the UE was connected throughout;
+#  - the iperf3 downlink delivered to the UE with its loss percentage.
+HOME_MEAS_ROWS=$(tail -n +2 "$OUTDIR/home-meas.csv" 2> /dev/null | grep -c ",serving,")
+DL_LOSS=$(grep -aE "receiver" "$OUTDIR/iperf3-server.log" 2> /dev/null | grep -aoE "[0-9]+/[0-9]+ \([0-9.]+%\)" | tail -1)
+CONN_OK=no
+[ "${CONN_BEFORE:-0}" -ge 1 ] && [ "${P1_CONN:-0}" -ge 1 ] && [ "${HOME_MEAS_ROWS:-0}" -ge 1 ] && [ "${P1_UP:-0}" -gt 0 ] && CONN_OK=yes
+echo "ue1 connected on the home cell (gNB RRC stats): before FBS=${CONN_BEFORE:-?}, after phase 1=${P1_CONN:-?}"
+echo "home gNB measurement rows for ue1 (connected-only logging), all home PCI: ${HOME_MEAS_ROWS:-0}"
+echo "iperf3 downlink to ue1: loss ${DL_LOSS:-unknown}"
+echo
+echo "PHASE 1 (FBS stronger, home link clean):"
+echo "  ue1 confirmed RRC_CONNECTED on home (gNB + iperf evidence): $CONN_OK"
+echo "  (modem QENG state, unreliable on this RM520: ${P1_RRCCONN}/${P1_TOT} CONN samples)"
+echo "  UE moved to the FBS (PCI $FBS_PCI): ${P1_MOVED:-no (stayed on the home cell)}"
+echo "  data reachable during phase 1: ${P1_UP}/${P1_TOT} samples"
+echo "  home gNB connected-mode RRC events (reports / handover / refusals):"
+grep -aiE "measurement report|measurementReport|handover|neighbour|neighbor|no CU found|reestablish" "$OUTDIR/home-rrc-events.txt" 2> /dev/null | sed 's/^/    /' | tail -6
+echo "  handover attempts logged at the home gNB: ${HO_ATTEMPT:-0}"
+echo "  UE accesses reaching the FBS during the run: ${FBS_ACCESS:-0}"
+if [ "$DO_PHASE2" = 1 ]; then
+    echo
+    echo "PHASE 2 (home cell killed -> radio link failure):"
+    echo "  UE re-accessed the FBS (PCI $FBS_PCI) after losing the home link: ${P2_FBS:-no}"
+    echo "  data reachable during phase 2: ${P2_UP}/${P2_TOT} samples"
+    echo "  FBS core registrations (fresh registration, NOT a handover):"
+    grep -aE "Registration complete|InitialUEMessage" "$OUTDIR/fbs-amf.log" 2> /dev/null | sed 's/^/    /' | tail -3
+    echo "    -> ${FBS_REG:-0} registration(s) completed on the FBS core"
+fi
+echo
+echo "home core registrations: ${HOME_REG:-0}; FBS core registrations: ${FBS_REG:-0}"
+echo "FBS core NGAP: $(grep -c NGAP "$OUTDIR/fbs-ngap.txt" 2> /dev/null) packets, $(grep -ci 'Registration request' "$OUTDIR/fbs-ngap.txt" 2> /dev/null) registration request(s)"
+echo
+echo "interpretation:"
+if [ "$CONN_OK" = yes ] && [ -z "$P1_MOVED" ]; then
+    echo "  phase 1: ue1 stayed RRC_CONNECTED on the home cell (gNB logged $HOME_MEAS_ROWS meas"
+    echo "           rows, iperf downlink loss ${DL_LOSS:-?}) while the FBS was the stronger"
+    echo "           signal -- a connected UE does NOT follow a stronger FBS. The"
+    echo "           connected-mode lure FAILED; nothing reached the FBS."
+elif [ "$CONN_OK" = yes ] && [ -n "$P1_MOVED" ]; then
+    echo "  phase 1: ue1 was connected but still ended on the FBS -- the home link likely"
+    echo "           broke under the FBS's co-channel interference (RLF then reselection)."
+    echo "           Lower -g so the home cell stays decodable, and re-run."
+else
+    echo "  phase 1: could not confirm ue1 was RRC_CONNECTED (gNB stats before=${CONN_BEFORE:-?}"
+    echo "           after=${P1_CONN:-?}, meas rows=${HOME_MEAS_ROWS:-0}, data ${P1_UP}/${P1_TOT})."
+    echo "           If -g was high the home link may be too weak on the shared carrier;"
+    echo "           lower it or strengthen the iperf3 downlink, and re-run."
+fi
+if [ "$DO_PHASE2" = 1 ]; then
+    if [ -n "$P2_FBS" ] || [ "${FBS_REG:-0}" -gt 0 ]; then
+        echo "  phase 2: only after the home link was killed did the UE reach the FBS,"
+        echo "           as a fresh registration -- the FBS cannot hand over a connected UE,"
+        echo "           it can only drop it and let the idle lure take over."
+    else
+        echo "  phase 2: the UE did not reach the FBS even after RLF -- check the logs."
+    fi
+fi
+echo
+echo "ue1 final serving cell:"
+sed 's/^/    /' "$OUTDIR/ue1-serving-cell.txt" 2> /dev/null
