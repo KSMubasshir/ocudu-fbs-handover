@@ -1,0 +1,268 @@
+#!/bin/bash
+# LTE False Base Station idle-reselection experiment: the 4G twin of
+# bin/run-fbs-exp. enb2 (N300 -> EPC 2 on epc2) is the FBS: it clones the home
+# cell -- same band 40 carrier (2350 MHz) and PLMN 999/99 as enb1 (X310 ->
+# EPC 1 on epc) -- with its own PCI (3) and a DIFFERENT TAC (2) on its own EPC.
+#
+# Flow: the UE attaches on the home network (enb1), goes idle, then the FBS
+# out-powers enb1 at the UE. The idle UE reselects to the FBS intra-frequency
+# and, finding a new TAC, performs a Tracking Area Update / attach on EPC 2.
+# The SIM homed on 999/99 ends up on the attacker's EPC -- the lure.
+#
+# Captures both EPCs' S1AP from before the eNBs start, both MME logs, both eNB
+# logs, and the UE serving cell over time (home PCI 1/TAC 1 -> FBS PCI 3/TAC 2).
+# Puts the COTS modem in LTE mode for the run and restores it at the end.
+#
+# -s lure (default) is the only implemented scenario; the DoS scenarios
+# (reject/drop_rrc/drop_nas) need an LTE FBS misbehaviour patch for the eNB,
+# which is not written yet (patches/oai-lte-fbs-misbehavior.patch).
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+HOSTS_FILE=$REPO/hosts.env
+REMOTE_BIN=/local/repository/bin
+HOME_PCI=1
+FBS_PCI=3
+FBS_STRONG=0     # gnb2ue1 attenuation once the FBS is on (min = strongest)
+HOME_WEAK=40     # ru1ue1 attenuation once the FBS is on (home faded below FBS)
+SHIELD=95        # attenuation that keeps a cell off the UE
+OUTDIR=""
+SCENARIO=lure
+
+usage() {
+    cat <<EOF
+usage:
+    run-fbs-lte-exp -h
+        show this help message
+    run-fbs-lte-exp [-s lure] [-o <dir>] [-f <hosts file>]
+        -s  scenario (default lure; reject/drop_rrc/drop_nas need the LTE FBS
+            patch, not yet implemented)
+        -o  local output directory (default traces/fbs-lte-<scenario>-<date>-<time>)
+        -f  hosts file setting SSH_USER, CN5G, CN5G2, CUDU, CUDU2, UE1
+            (reused names: CN5G=epc, CN5G2=epc2, CUDU=enb1, CUDU2=enb2)
+
+    OAI LTE must be built on enb1/enb2 and Open5GS EPC installed on epc (home)
+    and epc2 (FBS core, same PLMN 999/99 but TAC 2).
+EOF
+}
+
+while getopts "hs:o:f:" opt; do
+    case $opt in
+        h) usage; exit 0 ;;
+        s) SCENARIO=$OPTARG ;;
+        o) OUTDIR=$OPTARG ;;
+        f) HOSTS_FILE=$OPTARG ;;
+        *) usage; exit 1 ;;
+    esac
+done
+
+case $SCENARIO in
+    lure) ;;
+    reject|drop_rrc|drop_nas) echo "scenario $SCENARIO needs the LTE FBS patch (not yet implemented)"; exit 1 ;;
+    *) echo "invalid scenario: $SCENARIO"; usage; exit 1 ;;
+esac
+
+[ -f "$HOSTS_FILE" ] || { echo "$HOSTS_FILE not found"; usage; exit 1; }
+source "$HOSTS_FILE"
+# Reuse the 5G host variable names: CN5G=epc, CN5G2=epc2, CUDU=enb1, CUDU2=enb2.
+for var in SSH_USER CN5G CN5G2 CUDU CUDU2 UE1; do
+    [ -n "${!var}" ] || { echo "$var is not set in $HOSTS_FILE"; exit 1; }
+done
+EPC=$CN5G; EPC2=$CN5G2; ENB1=$CUDU; ENB2=$CUDU2
+
+OUTDIR=${OUTDIR:-$REPO/traces/fbs-lte-$SCENARIO-$(date +%Y-%m-%d-%H%M%S)}
+mkdir -p "$OUTDIR" || { echo "cannot create $OUTDIR"; exit 1; }
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new"
+
+on() { ssh $SSH_OPTS $SSH_USER@$1 'bash -s'; }
+step() { echo; echo "== $*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+push() {
+    local host=$1; shift
+    ssh $SSH_OPTS $SSH_USER@$host 'mkdir -p /tmp/fbs-bin' || return 1
+    scp -q $SSH_OPTS "$@" $SSH_USER@$host:/tmp/fbs-bin/ || return 1
+    ssh $SSH_OPTS $SSH_USER@$host "sudo install -m 775 /tmp/fbs-bin/* $REMOTE_BIN/"
+}
+push_cfg() {
+    local host=$1; shift
+    ssh $SSH_OPTS $SSH_USER@$host 'mkdir -p /tmp/fbs-cfg' || return 1
+    scp -q $SSH_OPTS "$@" $SSH_USER@$host:/tmp/fbs-cfg/ || return 1
+    ssh $SSH_OPTS $SSH_USER@$host "sudo mkdir -p /var/tmp/etc/oai && sudo install -m 644 /tmp/fbs-cfg/* /var/tmp/etc/oai/"
+}
+
+# Quectel serving cell. For LTE the line is +QENG: "servingcell",<state>,"LTE",
+# <duplex>,<MCC>,<MNC>,<cellID>,<PCID>,<EARFCN>,<band>,... -- state is field 2
+# and PCID is field 8, the same positions as the NR5G-SA line, so the field
+# parsing below is shared with the 5G script.
+ue_cell() {
+    on $UE1 <<'EOF'
+for n in 1 2 3; do
+    line=$(sudo sh -c 'chat -t 5 -sv "" AT OK "AT+QENG=\"servingcell\"" OK < /dev/ttyUSB2 > /dev/ttyUSB2' 2>&1 | grep -a "^+QENG" | tr -d '\r')
+    [ -n "$line" ] && { echo "$line"; break; }
+    sleep 2
+done
+EOF
+}
+ue_pci() { echo "$1" | awk -F, '{gsub(/ /,"",$8); print $8}'; }
+
+# Put the modem in LTE-only mode (default is NR5G). $1 = LTE | AUTO.
+ue_mode() {
+    local m=$1
+    on $UE1 <<EOF
+sudo sh -c 'chat -t 5 -sv "" AT OK "AT+QNWPREFCFG=\"mode_pref\",$m" OK < /dev/ttyUSB2 > /dev/ttyUSB2' 2>&1 | grep -aE "OK|ERROR" | tr -d '\r'
+EOF
+}
+
+start_enb() {
+    local host=$1 mode=$2 opt=""
+    [ -n "$mode" ] && opt=" -m $mode"
+    on $host <<EOF
+set -e
+[ -f /var/tmp/oai-setup-complete ] || { echo "\$(hostname -s): OAI LTE is not built"; exit 1; }
+sudo pkill -INT -x lte-softmodem || true
+for i in \$(seq 30); do pgrep -x lte-softmodem > /dev/null || break; sleep 1; done
+sudo pkill -KILL -x lte-softmodem || true
+tmux kill-session -t enb 2> /dev/null || true
+sudo rm -f /tmp/enb.log
+tmux new-session -d -s enb -x 200 -y 50 "$REMOTE_BIN/start-oai-enb$opt"
+EOF
+}
+# Wait for the eNB to complete S1 Setup with its MME and have the radio running.
+# OAI LTE markers vary by revision; adjust here if a build logs them differently.
+wait_enb() {
+    on $1 <<'EOF'
+for i in $(seq 120); do
+    if grep -aiqE "S1 Setup Response|S1SETUPRESP|Received S1AP_S1SETUP" /tmp/enb.log 2> /dev/null; then
+        echo "$(hostname -s): eNB completed S1 setup"; exit 0
+    fi
+    pgrep -x lte-softmodem > /dev/null || [ $i -lt 5 ] || break
+    sleep 2
+done
+echo "$(hostname -s): eNB did not complete S1 setup:"; tail -n 15 /tmp/enb.log; exit 1
+EOF
+}
+
+echo "LTE FBS scenario: $SCENARIO"
+
+step "Checking the nodes and installing scripts/configs"
+for host in $EPC $EPC2 $ENB1 $ENB2 $UE1; do
+    ssh $SSH_OPTS $SSH_USER@$host true || die "cannot reach $host; update $HOSTS_FILE"
+done
+for host in $EPC $EPC2; do
+    push $host "$REPO/bin/s1ap-capture" || die "copy to $host failed"
+done
+for host in $ENB1 $ENB2; do
+    push $host "$REPO/bin/start-oai-enb" || die "copy to $host failed"
+done
+push_cfg $ENB1 "$REPO/etc/oai-lte/enb1_x310_epc1.conf" || die "config copy to $ENB1 failed"
+push_cfg $ENB2 "$REPO/etc/oai-lte/enb2_n300_epc2.conf" || die "config copy to $ENB2 failed"
+
+step "Capturing S1AP on the home EPC and the FBS EPC"
+for host in $EPC $EPC2; do
+    on $host <<EOF || die "could not start the S1AP capture on $host"
+tmux kill-session -t s1ap 2> /dev/null
+sudo pkill -INT -x tcpdump
+sudo rm -f /tmp/s1ap.pcap
+tmux new-session -d -s s1ap '$REMOTE_BIN/s1ap-capture /tmp/s1ap.pcap'
+sleep 2
+pgrep -x tcpdump > /dev/null
+EOF
+done
+START=$(on $EPC <<< 'date +%s')
+
+step "Starting the home eNB (-> EPC 1) on enb1 and the FBS eNB (-> EPC 2) on enb2"
+start_enb $ENB1 "" & p1=$!
+start_enb $ENB2 "" & p2=$!
+wait $p1 || die "could not start the home eNB"
+wait $p2 || die "could not start the FBS eNB"
+wait_enb $ENB1 || die "home eNB is not running"
+wait_enb $ENB2 || die "FBS eNB is not running"
+
+step "Putting ue1 in LTE mode and attaching to the home network (FBS shielded)"
+ue_mode LTE
+on $ENB1 <<EOF || die "could not set attenuators"
+$REMOTE_BIN/update-attens ru1ue1 0
+$REMOTE_BIN/update-attens gnb2ue1 $SHIELD
+EOF
+on $UE1 <<EOF || die "ue1 did not get a data connection on the home network"
+pgrep -x quectel-CM > /dev/null || { tmux kill-session -t cm 2> /dev/null; tmux new-session -d -s cm 'sudo quectel-CM -s internet -4'; }
+$REMOTE_BIN/module-airplane.sh > /dev/null 2>&1
+sleep 3
+$REMOTE_BIN/module-on.sh > /dev/null 2>&1
+for i in \$(seq 45); do
+    ping -c 1 -W 1 10.45.0.1 > /dev/null 2>&1 && { echo "ue1 reaches the home data network"; exit 0; }
+    sleep 2
+done
+exit 1
+EOF
+echo "home serving cell: $(ue_cell)"
+
+step "Letting ue1 go idle on the home network"
+sleep 20
+echo "idle serving cell (expect PCI $HOME_PCI): $(ue_cell)"
+
+step "Turning on the FBS (out-powering the home cell at the idle UE)"
+on $ENB1 <<EOF || die "could not set attenuators"
+$REMOTE_BIN/update-attens gnb2ue1 $FBS_STRONG
+$REMOTE_BIN/update-attens ru1ue1 $HOME_WEAK
+EOF
+
+step "Watching the idle UE reselect to the FBS"
+FBS_SEEN=""
+for i in $(seq 15); do
+    cell=$(ue_cell); pci=$(ue_pci "$cell")
+    echo "  [$i] $cell"
+    [ "$pci" = "$FBS_PCI" ] && FBS_SEEN=yes
+    sleep 4
+done
+
+step "Stopping captures and collecting results in $OUTDIR"
+on $UE1 <<'EOF'
+sudo sh -c 'chat -t 5 -sv "" AT OK "AT+QENG=\"servingcell\"" OK < /dev/ttyUSB2 > /dev/ttyUSB2' 2>&1 | grep -a "^+QENG" | tr -d '\r' > /tmp/ue-cell.txt
+cat /tmp/ue-cell.txt
+EOF
+for host in $EPC $EPC2; do
+    on $host <<EOF
+tmux send-keys -t s1ap C-c
+sleep 1
+sudo pkill -INT -x tcpdump
+sudo journalctl -u open5gs-mmed --since @$START --no-pager -o short-precise 2> /dev/null | sed 's/\x1b\[[0-9;]*m//g' > /tmp/mme.log
+sudo tshark -r /tmp/s1ap.pcap -Y 's1ap || (sctp && !(sctp.chunk_type == 0 || sctp.chunk_type == 3 || sctp.chunk_type == 4 || sctp.chunk_type == 5))' 2> /dev/null > /tmp/s1ap.txt
+true
+EOF
+done
+fetch() { scp -q -C $SSH_OPTS $SSH_USER@$1:$2 "$OUTDIR/$3" || echo "could not fetch $2 from $1"; }
+fetch $EPC  /tmp/s1ap.pcap home-s1ap.pcap
+fetch $EPC  /tmp/s1ap.txt  home-s1ap.txt
+fetch $EPC  /tmp/mme.log   home-mme.log
+fetch $EPC2 /tmp/s1ap.pcap fbs-s1ap.pcap
+fetch $EPC2 /tmp/s1ap.txt  fbs-s1ap.txt
+fetch $EPC2 /tmp/mme.log   fbs-mme.log
+fetch $ENB1 /tmp/enb.log   home-enb.log
+fetch $ENB2 /tmp/enb.log   fbs-enb.log
+fetch $UE1  /tmp/ue-cell.txt ue1-serving-cell.txt
+
+step "Restoring the home cell, returning ue1, restoring modem mode"
+on $ENB1 <<EOF
+$REMOTE_BIN/update-attens gnb2ue1 $SHIELD
+$REMOTE_BIN/update-attens ru1ue1 0
+EOF
+sleep 10
+echo "serving cell after restore (expect PCI $HOME_PCI): $(ue_cell)"
+ue_mode AUTO
+
+step "Stopping both eNBs"
+for host in $ENB1 $ENB2; do
+    on $host <<'EOF'
+tmux send-keys -t enb C-c 2> /dev/null; sleep 1
+sudo pkill -INT -x lte-softmodem; sleep 2; sudo pkill -KILL -x lte-softmodem
+tmux kill-session -t enb 2> /dev/null; true
+EOF
+done
+
+step "Summary ($SCENARIO)"
+echo "idle UE reselected to the FBS (PCI $FBS_PCI): ${FBS_SEEN:-no (UE stayed on the home cell)}"
+echo "FBS EPC attach/TAU (the UE lured onto the attacker network):"
+grep -aiE "Attach complete|Tracking area update|Initial UE Message|imsi-99999" "$OUTDIR/fbs-mme.log" 2> /dev/null | sed 's/^/    /' | tail -5
+echo "home EPC S1AP: $(grep -c S1AP "$OUTDIR/home-s1ap.txt" 2> /dev/null) packets; FBS EPC S1AP: $(grep -c S1AP "$OUTDIR/fbs-s1ap.txt" 2> /dev/null) packets"
+echo "ue1 final serving cell:"
+sed 's/^/    /' "$OUTDIR/ue1-serving-cell.txt" 2> /dev/null

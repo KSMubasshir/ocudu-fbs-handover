@@ -1,0 +1,302 @@
+#!/bin/bash
+# LTE FBS CONNECTED-mode experiment: the 4G twin of run-fbs-connected-exp.
+# Does a UE that is RRC_CONNECTED on the home eNB follow a stronger FBS? As in
+# 5G, connected-mode mobility is network-controlled and the FBS (enb2, its own
+# EPC, no X2 relation) is not a valid handover target, so the connected UE
+# should stay on the home cell while the FBS out-powers it.
+#
+# Same trick as the 5G script: do NOT fade the home matrix path (that breaks the
+# link and drops the UE to idle). Instead lower the home eNB TX power in config
+# (att_tx in the RUs block, -g dB) so the FBS out-powers it while the home link
+# stays clean, and hold the UE RRC_CONNECTED with a steady iperf3 downlink.
+# Connected state is judged from the iperf3 loss (the LTE eNB does not write an
+# RRC stats log, and the Quectel QENG state field is unreliable), not QENG.
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+HOSTS_FILE=$REPO/hosts.env
+REMOTE_BIN=/local/repository/bin
+HOME_PCI=1
+FBS_PCI=3
+FBS_STRONG=0
+HOME_TXATT=6      # dB subtracted from the home eNB TX power (RUs att_tx)
+HOME_KILL=95      # ru1ue1 in phase 2 (-K): home cell taken off the UE (RLF)
+SHIELD=95
+PHASE1=40
+PHASE2=40
+DO_PHASE2=0
+OUTDIR=""
+
+usage() {
+    cat <<EOF
+usage:
+    run-fbs-lte-connected-exp [-g <db>] [-1 <sec>] [-K [-2 <sec>]] [-o <dir>] [-f <hosts file>]
+        -g  dB to lower the home eNB TX power in config (att_tx; default $HOME_TXATT)
+        -1  seconds to hold phase 1 (default $PHASE1)
+        -K  also run phase 2: kill the home cell to force RLF (off by default)
+        -2  seconds to hold phase 2 when -K is given (default $PHASE2)
+        -o  output dir (default traces/fbs-lte-connected-<date>-<time>)
+        -f  hosts file (CN5G=epc, CN5G2=epc2, CUDU=enb1, CUDU2=enb2, UE1)
+
+    OAI LTE built on enb1/enb2, Open5GS EPC on epc/epc2, iperf3 on ue1 and epc.
+EOF
+}
+
+while getopts "hg:1:2:Ko:f:" opt; do
+    case $opt in
+        h) usage; exit 0 ;;
+        g) HOME_TXATT=$OPTARG ;;
+        1) PHASE1=$OPTARG ;;
+        2) PHASE2=$OPTARG ;;
+        K) DO_PHASE2=1 ;;
+        o) OUTDIR=$OPTARG ;;
+        f) HOSTS_FILE=$OPTARG ;;
+        *) usage; exit 1 ;;
+    esac
+done
+for v in PHASE1 PHASE2; do [[ ${!v} =~ ^[1-9][0-9]*$ ]] || { echo "invalid -${v#PHASE}"; usage; exit 1; }; done
+[[ $HOME_TXATT =~ ^[0-9]+$ ]] || { echo "invalid -g"; usage; exit 1; }
+
+[ -f "$HOSTS_FILE" ] || { echo "$HOSTS_FILE not found"; usage; exit 1; }
+source "$HOSTS_FILE"
+for var in SSH_USER CN5G CN5G2 CUDU CUDU2 UE1; do
+    [ -n "${!var}" ] || { echo "$var is not set in $HOSTS_FILE"; exit 1; }
+done
+EPC=$CN5G; EPC2=$CN5G2; ENB1=$CUDU; ENB2=$CUDU2
+
+OUTDIR=${OUTDIR:-$REPO/traces/fbs-lte-connected-$(date +%Y-%m-%d-%H%M%S)}
+mkdir -p "$OUTDIR" || { echo "cannot create $OUTDIR"; exit 1; }
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new"
+
+on() { ssh $SSH_OPTS $SSH_USER@$1 'bash -s'; }
+step() { echo; echo "== $*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+push() { local host=$1; shift; ssh $SSH_OPTS $SSH_USER@$host 'mkdir -p /tmp/fbs-bin' && scp -q $SSH_OPTS "$@" $SSH_USER@$host:/tmp/fbs-bin/ && ssh $SSH_OPTS $SSH_USER@$host "sudo install -m 775 /tmp/fbs-bin/* $REMOTE_BIN/"; }
+push_cfg() { local host=$1; shift; ssh $SSH_OPTS $SSH_USER@$host 'mkdir -p /tmp/fbs-cfg' && scp -q $SSH_OPTS "$@" $SSH_USER@$host:/tmp/fbs-cfg/ && ssh $SSH_OPTS $SSH_USER@$host "sudo mkdir -p /var/tmp/etc/oai && sudo install -m 644 /tmp/fbs-cfg/* /var/tmp/etc/oai/"; }
+
+ue_cell() {
+    on $UE1 <<'EOF'
+for n in 1 2 3; do
+    line=$(sudo sh -c 'chat -t 5 -sv "" AT OK "AT+QENG=\"servingcell\"" OK < /dev/ttyUSB2 > /dev/ttyUSB2' 2>&1 | grep -a "^+QENG" | tr -d '\r')
+    [ -n "$line" ] && { echo "$line"; break; }
+    sleep 2
+done
+EOF
+}
+ue_pci() { echo "$1" | awk -F, '{gsub(/ /,"",$8); print $8}'; }
+ue_ping() { on $UE1 <<'EOF'
+ping -c 1 -W 1 10.45.0.1 > /dev/null 2>&1 && echo up || echo down
+EOF
+}
+ue_mode() { local m=$1; on $UE1 <<EOF
+sudo sh -c 'chat -t 5 -sv "" AT OK "AT+QNWPREFCFG=\"mode_pref\",$m" OK < /dev/ttyUSB2 > /dev/ttyUSB2' 2>&1 | grep -aE "OK|ERROR" | tr -d '\r'
+EOF
+}
+
+start_enb() {
+    local host=$1
+    on $host <<EOF
+set -e
+[ -f /var/tmp/oai-setup-complete ] || { echo "\$(hostname -s): OAI LTE is not built"; exit 1; }
+sudo pkill -INT -x lte-softmodem || true
+for i in \$(seq 30); do pgrep -x lte-softmodem > /dev/null || break; sleep 1; done
+sudo pkill -KILL -x lte-softmodem || true
+tmux kill-session -t enb 2> /dev/null || true
+sudo rm -f /tmp/enb.log
+tmux new-session -d -s enb -x 200 -y 50 "$REMOTE_BIN/start-oai-enb"
+EOF
+}
+wait_enb() {
+    on $1 <<'EOF'
+for i in $(seq 120); do
+    if grep -aiqE "S1 Setup Response|S1SETUPRESP|Received S1AP_S1SETUP" /tmp/enb.log 2> /dev/null; then
+        echo "$(hostname -s): eNB completed S1 setup"; exit 0
+    fi
+    pgrep -x lte-softmodem > /dev/null || [ $i -lt 5 ] || break
+    sleep 2
+done
+echo "$(hostname -s): eNB did not complete S1 setup:"; tail -n 15 /tmp/enb.log; exit 1
+EOF
+}
+
+echo "LTE FBS connected-mode: home TX lowered ${HOME_TXATT} dB; phase 1 ${PHASE1}s$([ $DO_PHASE2 = 1 ] && echo ", phase 2 ${PHASE2}s (home KILLED, -K)" || echo " only; home kept up")"
+
+step "Checking nodes and installing scripts/configs"
+for host in $EPC $EPC2 $ENB1 $ENB2 $UE1; do ssh $SSH_OPTS $SSH_USER@$host true || die "cannot reach $host"; done
+for host in $EPC $EPC2; do push $host "$REPO/bin/s1ap-capture" || die "copy to $host failed"; done
+for host in $ENB1 $ENB2; do push $host "$REPO/bin/start-oai-enb" || die "copy to $host failed"; done
+push_cfg $ENB1 "$REPO/etc/oai-lte/enb1_x310_epc1.conf" || die "config copy to $ENB1 failed"
+push_cfg $ENB2 "$REPO/etc/oai-lte/enb2_n300_epc2.conf" || die "config copy to $ENB2 failed"
+
+# Lower the home eNB TX power in its pushed config (RUs att_tx), leaving the
+# home matrix path at 0 so the link stays clean while the FBS out-powers it.
+if [ "$HOME_TXATT" -gt 0 ]; then
+    on $ENB1 <<EOF || die "could not set home att_tx"
+sudo sed -i 's/^\( *att_tx *=\).*/\1 $HOME_TXATT/' /var/tmp/etc/oai/enb1_x310_epc1.conf
+echo "home eNB att_tx: \$(grep -E '^ *att_tx' /var/tmp/etc/oai/enb1_x310_epc1.conf | tr -d ' ')"
+EOF
+fi
+
+step "Capturing S1AP on both EPCs"
+for host in $EPC $EPC2; do
+    on $host <<EOF || die "could not start S1AP capture on $host"
+tmux kill-session -t s1ap 2> /dev/null; sudo pkill -INT -x tcpdump; sudo rm -f /tmp/s1ap.pcap
+tmux new-session -d -s s1ap '$REMOTE_BIN/s1ap-capture /tmp/s1ap.pcap'
+sleep 2; pgrep -x tcpdump > /dev/null
+EOF
+done
+START=$(on $EPC <<< 'date +%s')
+
+step "Starting the home eNB (-> EPC 1) and the FBS eNB (-> EPC 2)"
+start_enb $ENB1 & p1=$!
+start_enb $ENB2 & p2=$!
+wait $p1 || die "could not start the home eNB"
+wait $p2 || die "could not start the FBS eNB"
+wait_enb $ENB1 || die "home eNB is not running"
+wait_enb $ENB2 || die "FBS eNB is not running"
+
+step "Putting ue1 in LTE mode and attaching to the home network (FBS shielded)"
+ue_mode LTE
+on $ENB1 <<EOF || die "could not set attenuators"
+$REMOTE_BIN/update-attens ru1ue1 0
+$REMOTE_BIN/update-attens gnb2ue1 $SHIELD
+EOF
+on $UE1 <<EOF || die "ue1 did not get a data connection on the home network"
+pgrep -x quectel-CM > /dev/null || { tmux kill-session -t cm 2> /dev/null; tmux new-session -d -s cm 'sudo quectel-CM -s internet -4'; }
+$REMOTE_BIN/module-airplane.sh > /dev/null 2>&1
+sleep 3
+$REMOTE_BIN/module-on.sh > /dev/null 2>&1
+for i in \$(seq 45); do
+    ping -c 1 -W 1 10.45.0.1 > /dev/null 2>&1 && { echo "ue1 reaches the home data network"; exit 0; }
+    sleep 2
+done
+exit 1
+EOF
+echo "home serving cell: $(ue_cell)"
+
+step "Starting a steady iperf3 downlink to hold ue1 RRC_CONNECTED"
+UE_IP=$(on $UE1 <<'EOF'
+ip -4 addr show 2>/dev/null | awk '/inet 10\.45\./{print $2}' | cut -d/ -f1 | head -1
+EOF
+)
+[ -n "$UE_IP" ] || die "could not read ue1 data IP"
+echo "ue1 data IP: $UE_IP"
+on $UE1 <<'EOF'
+sudo pkill -x iperf3 2> /dev/null; sleep 1
+nohup iperf3 -s > /tmp/iperf3-server.log 2>&1 &
+sleep 1; pgrep -x iperf3 > /dev/null && echo "iperf3 server up on ue1" || echo "iperf3 server did NOT start"
+EOF
+on $EPC <<EOF
+sudo pkill -x iperf3 2> /dev/null; sleep 1
+nohup iperf3 -c $UE_IP -u -b 4M -t $((PHASE1 + 40)) > /tmp/iperf3-dl.log 2>&1 &
+sleep 3; pgrep -x iperf3 > /dev/null && echo "iperf3 downlink running from the EPC" || { echo "iperf3 downlink did NOT start:"; tail -3 /tmp/iperf3-dl.log 2> /dev/null; }
+EOF
+sleep 5
+echo "serving cell before raising the FBS (expect PCI $HOME_PCI): $(ue_cell)"
+
+step "PHASE 1: raising the FBS above the (TX-trimmed) home cell, UE stays connected (${PHASE1}s)"
+on $ENB1 <<EOF || die "could not set attenuators"
+$REMOTE_BIN/update-attens gnb2ue1 $FBS_STRONG
+$REMOTE_BIN/update-attens ru1ue1 0
+EOF
+P1_MOVED=""; P1_UP=0; P1_TOT=0
+for i in $(seq $((PHASE1/4))); do
+    cell=$(ue_cell); pci=$(ue_pci "$cell"); reach=$(ue_ping)
+    [ "$reach" = up ] && P1_UP=$((P1_UP+1)); P1_TOT=$((P1_TOT+1))
+    echo "  [p1 $i] PCI ${pci:-?} data=$reach"
+    [ "$pci" = "$FBS_PCI" ] && P1_MOVED=yes
+    sleep 4
+done
+
+if [ "$DO_PHASE2" = 1 ]; then
+    step "PHASE 2: killing the home cell to force RLF (${PHASE2}s)"
+    on $ENB1 <<EOF || die "could not set attenuators"
+$REMOTE_BIN/update-attens ru1ue1 $HOME_KILL
+$REMOTE_BIN/update-attens gnb2ue1 $FBS_STRONG
+EOF
+    P2_FBS=""; P2_UP=0; P2_TOT=0
+    for i in $(seq $((PHASE2/4))); do
+        cell=$(ue_cell); pci=$(ue_pci "$cell"); reach=$(ue_ping)
+        [ "$reach" = up ] && P2_UP=$((P2_UP+1)); P2_TOT=$((P2_TOT+1))
+        echo "  [p2 $i] PCI ${pci:-?} data=$reach"
+        [ "$pci" = "$FBS_PCI" ] && P2_FBS=yes
+        sleep 4
+    done
+fi
+
+step "Stopping captures and collecting results in $OUTDIR"
+on $EPC <<< 'sudo pkill -x iperf3 2> /dev/null; true'
+on $UE1 <<'EOF'
+sudo pkill -x iperf3 2> /dev/null; sleep 1
+sudo sh -c 'chat -t 5 -sv "" AT OK "AT+QENG=\"servingcell\"" OK < /dev/ttyUSB2 > /dev/ttyUSB2' 2>&1 | grep -a "^+QENG" | tr -d '\r' > /tmp/ue-cell.txt
+cat /tmp/ue-cell.txt
+EOF
+for host in $EPC $EPC2; do
+    on $host <<EOF
+tmux send-keys -t s1ap C-c; sleep 1; sudo pkill -INT -x tcpdump
+sudo journalctl -u open5gs-mmed --since @$START --no-pager -o short-precise 2> /dev/null | sed 's/\x1b\[[0-9;]*m//g' > /tmp/mme.log
+sudo tshark -r /tmp/s1ap.pcap -Y 's1ap' 2> /dev/null > /tmp/s1ap.txt
+true
+EOF
+done
+fetch() { scp -q -C $SSH_OPTS $SSH_USER@$1:$2 "$OUTDIR/$3" || echo "could not fetch $2 from $1"; }
+fetch $EPC  /tmp/s1ap.pcap home-s1ap.pcap
+fetch $EPC  /tmp/s1ap.txt  home-s1ap.txt
+fetch $EPC  /tmp/mme.log   home-mme.log
+fetch $EPC2 /tmp/s1ap.pcap fbs-s1ap.pcap
+fetch $EPC2 /tmp/s1ap.txt  fbs-s1ap.txt
+fetch $EPC2 /tmp/mme.log   fbs-mme.log
+fetch $ENB1 /tmp/enb.log   home-enb.log
+fetch $ENB2 /tmp/enb.log   fbs-enb.log
+fetch $UE1  /tmp/ue-cell.txt ue1-serving-cell.txt
+fetch $EPC  /tmp/iperf3-dl.log iperf3-downlink.log
+fetch $UE1  /tmp/iperf3-server.log iperf3-server.log
+
+step "Restoring the home cell, returning ue1, restoring modem mode"
+on $ENB1 <<EOF
+$REMOTE_BIN/update-attens gnb2ue1 $SHIELD
+$REMOTE_BIN/update-attens ru1ue1 0
+EOF
+sleep 10
+echo "serving cell after restore (expect PCI $HOME_PCI): $(ue_cell)"
+ue_mode AUTO
+
+step "Stopping both eNBs"
+for host in $ENB1 $ENB2; do
+    on $host <<'EOF'
+tmux send-keys -t enb C-c 2> /dev/null; sleep 1
+sudo pkill -INT -x lte-softmodem; sleep 2; sudo pkill -KILL -x lte-softmodem
+tmux kill-session -t enb 2> /dev/null; true
+EOF
+done
+
+step "Summary (LTE connected-mode)"
+DL_LOSS=$(grep -aE "receiver" "$OUTDIR/iperf3-server.log" 2> /dev/null | grep -aoE "[0-9]+/[0-9]+ \([0-9.]+%\)" | tail -1)
+FBS_REG=$(grep -aciE "Attach complete|Tracking area update" "$OUTDIR/fbs-mme.log" 2> /dev/null)
+CONN_OK=no; [ -n "$DL_LOSS" ] && [ "${P1_UP:-0}" -gt 0 ] && CONN_OK=yes
+echo "iperf3 downlink loss: ${DL_LOSS:-unknown} (authoritative connected-state evidence)"
+echo
+echo "PHASE 1 (FBS stronger, home link clean):"
+echo "  ue1 confirmed connected (iperf delivered + data up): $CONN_OK"
+echo "  UE moved to the FBS (PCI $FBS_PCI): ${P1_MOVED:-no (stayed on the home cell)}"
+echo "  data reachable during phase 1: ${P1_UP}/${P1_TOT} samples"
+echo "  UE accesses / attaches on the FBS EPC: ${FBS_REG:-0}"
+if [ "$DO_PHASE2" = 1 ]; then
+    echo
+    echo "PHASE 2 (home cell killed -> RLF):"
+    echo "  UE re-accessed the FBS (PCI $FBS_PCI): ${P2_FBS:-no}"
+    echo "  data reachable during phase 2: ${P2_UP}/${P2_TOT} samples"
+fi
+echo
+echo "interpretation:"
+if [ "$CONN_OK" = yes ] && [ -z "$P1_MOVED" ]; then
+    echo "  phase 1: ue1 stayed connected on the home cell (iperf loss ${DL_LOSS:-?}) while the"
+    echo "           FBS was stronger -- a connected LTE UE does NOT follow a stronger FBS."
+elif [ "$CONN_OK" = yes ] && [ -n "$P1_MOVED" ]; then
+    echo "  phase 1: connected but ended on the FBS -- home link likely broke under the FBS's"
+    echo "           co-channel interference (RLF -> reselect). Lower -g and re-run."
+else
+    echo "  phase 1: could not confirm ue1 was connected (iperf loss ${DL_LOSS:-?}, data ${P1_UP}/${P1_TOT});"
+    echo "           lower -g or strengthen the iperf3 downlink, and re-run."
+fi
+echo
+echo "ue1 final serving cell:"
+sed 's/^/    /' "$OUTDIR/ue1-serving-cell.txt" 2> /dev/null
