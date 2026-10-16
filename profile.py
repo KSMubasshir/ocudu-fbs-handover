@@ -1,5 +1,21 @@
 #!/usr/bin/env python
 
+# POWDER profile for the 4G (LTE) false base station experiments: the LTE twin
+# of the 5G FBS profile (the root profile.py on the oai-fbs branch). It mirrors
+# that topology exactly -- two independent cores, a home eNB and an FBS eNB on
+# the X310 and
+# N300, two COTS UE NUCs, and the programmable attenuator matrix -- but runs an
+# LTE stack (OAI lte-softmodem + Open5GS in EPC mode) so the same idle-lure and
+# connected-mode tests can be run against LTE and compared with 5G.
+#
+# Why this layout and not the legacy srsRAN handover profile (legacy-lte/): the
+# FBS findings depend on real COTS modem behaviour (idle reselection, QENG,
+# connected-mode), two separate cores holding the same subscribers on different
+# TACs (so the lure triggers mobility/TAU on the attacker core), and the
+# conducted attenuator matrix. A software srsUE on a NUC+B210 with one shared
+# srsEPC cannot reproduce those, so this profile reuses the 5G FBS hardware and
+# matrix and only swaps the radio-access and core software for LTE.
+
 import os
 
 import geni.portal as portal
@@ -10,90 +26,55 @@ import geni.rspec.emulab as emulab
 
 
 tourDescription = """
-### OAI 5G: a second gNB on its own core with a foreign PLMN
+### OAI 4G/LTE: a false base station on its own EPC (LTE twin of the 5G FBS profile)
 
-This profile instantiates two independent OpenAirInterface (OAI) 5G networks on POWDER in a conducted RF environment with programmable attenuators. gNB 2 is **not** attached to the same core as gNB 1; it has its own Open5GS core broadcasting a different PLMN, so it is a separate network with no Xn/N2 link and no shared core. A 5G gNB cannot run without a core (it needs an AMF for NG Setup and to establish PDU sessions), so a second core is deployed for it.
+This profile instantiates two independent OpenAirInterface (OAI) LTE networks on POWDER in a conducted RF environment with programmable attenuators. eNB 2 is **not** attached to the same core as eNB 1; it has its own Open5GS EPC and is the **false base station (FBS)**. It clones eNB 1's carrier (same EARFCN) and PLMN but keeps its own physical cell identity and broadcasts a **different TAC** on its own EPC, which holds the same subscribers.
 
 The following will be deployed:
-- Open5GS core 1 (`cn5g`, Dell R430), PLMN 999/99 (home)
-- OAI gNB 1 (`cudu`, Dell R740 + USRP X310, daughter card A) -> core 1: gNB ID 411, PCI 1
-- Open5GS core 2 (`cn5g2`, Dell R430), PLMN 999/99, TAC 2 (the FBS core)
-- OAI gNB 2 (`cudu2`, Dell R740 + USRP N300) -> core 2: gNB ID 412, PCI 3 (the false base station)
-- 2 Intel NUCs w/ Quectel RM520 COTS UEs
+- Open5GS EPC 1 (`epc`, Dell R430), home PLMN 999/99, TAC 1 (192.168.1.1)
+- OAI eNB 1 (`enb1`, Dell R740 + USRP X310) -> EPC 1 (192.168.1.2), the home cell
+- Open5GS EPC 2 (`epc2`, Dell R430), same PLMN 999/99, TAC 2 (192.168.1.4), the FBS core
+- OAI eNB 2 (`enb2`, Dell R740 + USRP N300) -> EPC 2 (192.168.1.3), the false base station
+- 2 Intel NUCs w/ Quectel RM520 COTS UEs (the RM520 is 4G/5G; here it runs in LTE)
 
-Each gNB serves one 40 MHz (106 PRB, 30 kHz SCS) band 78 cell. gNB 2 is the false base station: it clones gNB 1's carrier (3619.2 MHz, SSB ARFCN 641280) and PLMN (999/99) but keeps its own PCI (3) and broadcasts a different TAC (2) on its own core 2, which holds the same subscribers. With gNB 2 shielded the UE registers on gNB 1 (core 1); when gNB 2 out-powers gNB 1 at an idle UE, the UE reselects to the FBS intra-frequency and triggers mobility registration on core 2 (see `bin/run-fbs-exp`).
+With eNB 2 shielded the UE attaches on eNB 1 / EPC 1 (home); when eNB 2 out-powers eNB 1 at an idle UE, the UE reselects to the FBS and, finding a new TAC, performs a Tracking Area Update / attach on EPC 2. The connected-mode counterpart (does a UE connected on eNB 1 follow a stronger FBS?) mirrors the 5G `bin/run-fbs-connected-exp`.
 
 #### Measurements and observation points
 
-- **Programmable attenuator matrix**: `bin/atten -l` lists the RF paths this experiment controls, `bin/update-attens <group> <0..95>` sets every path of a gNB/UE pair (actual attenuation is 30 + value dB; `ru1ue1`/`ru1ue2` are gNB 1, `gnb2ue1`/`gnb2ue2` are gNB 2), and `bin/handover-gnb <ue> <gnb>` steps one pair up while the other steps down. Run these on `cudu` or `cudu2`; attenuator control hangs on the NUCs.
-- **gNB output and log**: `bin/start-oai-gnb` writes the `nr-softmodem` output to `/tmp/gnb.log` (RRC and NGAP at debug level). `nrRRC_stats.log` and `nrMAC_stats.log` in `/var/tmp/oai/cmake_targets/ran_build/build` list the connected UEs, their IDs and their measurement reports.
-- **COTS UE serving cell and RF readings** (on `ue1`/`ue2`): `bin/ue_metrics.py` polls the modem every second and logs PCI, cell id, TAC, ARFCN, band, bandwidth, RSRP, RSRQ, SINR and TX power as JSON; `bin/ue_app.py` is an interactive terminal UI for the same modem; `bin/quectel_control.py scan` runs a network scan (`AT+QSCAN`) that lists the cells and their PLMNs the modem can see, including the foreign one.
-- **Both cores**: AMF and SMF logs via `journalctl` on `cn5g` and `cn5g2`; `bin/ngap-capture` on either captures that core's NGAP to a pcap.
-- **End-to-end traffic**: `ping` between the UE and its core's UPF (`10.45.0.1`), and `iperf3` (installed on the cores, the gNB nodes and the UE nodes).
+- **Programmable attenuator matrix**: `bin/atten -l` lists the RF paths, `bin/update-attens <group> <0..95>` sets a eNB/UE pair (actual attenuation is 30 + value dB; `ru1ue1`/`ru1ue2` are eNB 1, `gnb2ue1`/`gnb2ue2` are eNB 2). Run on `enb1` or `enb2`, not the NUCs.
+- **eNB output and log**: `start-oai-enb` writes `lte-softmodem` output to `/tmp/enb.log`.
+- **COTS UE serving cell and RF readings** (on `ue1`/`ue2`): the same Quectel tooling as the 5G profile (`bin/ue_metrics.py`, `bin/quectel_control.py scan`), reporting the LTE serving cell, EARFCN, PCI, TAC, RSRP/RSRQ/SINR.
+- **Both cores**: Open5GS MME logs via `journalctl` on `epc` and `epc2`; an S1AP capture (SCTP 36412) on either.
+- **End-to-end traffic**: `ping`/`iperf3` between the UE and its EPC's SGW-U/PGW-U.
 """
 
 tourInstructions = """
 
-Startup scripts will still be running when your experiment becomes ready. Watch the "Startup" column on the "List View" tab for your experiment and wait until all of the compute nodes show "Finished" before proceeding (the OAI build takes a while).
+Startup scripts will still be running when the experiment becomes ready. Wait until all compute nodes show "Finished" in the List View (the OAI build takes a while).
 
-Log into each core and monitor its AMF and SMF logs:
-
-```
-# on the cn5g node (core 1, PLMN 999/99)
-sudo journalctl -u open5gs-amfd -u open5gs-smfd -f --output cat
-
-# on the cn5g2 node (core 2, PLMN 001/01)
-sudo journalctl -u open5gs-amfd -u open5gs-smfd -f --output cat
-```
-
-Start one gNB on each gNB node. The script picks the node's config (gNB 1 -> core 1 on `cudu`, gNB 2 -> core 2 on `cudu2`), starts `nr-softmodem` and keeps it in the foreground, writing to `/tmp/gnb.log`:
+Monitor each EPC's MME:
 
 ```
-# on the cudu node (gNB 1, X310, PCI 1, PLMN 999/99)
-/local/repository/bin/start-oai-gnb
+# on the epc node (home, PLMN 999/99, TAC 1)
+sudo journalctl -u open5gs-mmed -f --output cat
 
-# on the cudu2 node (gNB 2, N300, PCI 3, PLMN 001/01)
-/local/repository/bin/start-oai-gnb
+# on the epc2 node (FBS core, PLMN 999/99, TAC 2)
+sudo journalctl -u open5gs-mmed -f --output cat
 ```
 
-gNB 1 should complete NG Setup in the `cn5g` AMF log and gNB 2 in the `cn5g2` AMF log.
-
-Note: OAI is built against the UHD 4.10 packages vendored in this repository (`debs/`), and the radios must carry FPGA images from the same UHD release. If `nr-softmodem` (or `uhd_usrp_probe --args addr=192.168.30.2`) fails with `RFNoC protocol mismatch between SW and HW`, flash the X310 with `sudo uhd_images_downloader -t x3xx` and `uhd_image_loader --args="type=x300,addr=192.168.30.2,fpga=XG"`, then power cycle `sdru-sdr` from the portal.
-
-In a session on the `ue1` node, start the UE connection manager with the target DNN `internet` in `ipv4` mode, and in another session bring the COTS UE out of airplane mode:
+Start one eNB on each eNB node (eNB 1 -> EPC 1 on `enb1`, eNB 2 -> EPC 2 on `enb2`):
 
 ```
-# on the ue node
-sudo quectel-CM -s internet -4
+# on enb1 (home, X310)
+/local/repository/bin/start-oai-enb
+
+# on enb2 (FBS, N300)
+/local/repository/bin/start-oai-enb
 ```
 
-```
-# on the ue node
-/local/repository/bin/module-on.sh
-```
+Each eNB should complete S1 Setup in its EPC's MME log. Attach ue1 on the home network (this profile initializes the attenuators so eNB 1 <-> ue1 has minimum attenuation and all other paths maximum), then raise the FBS at the UE and run the lure / connected-mode scripts under `bin/`.
 
-The UE registers on gNB 1 / core 1 (home PLMN 999/99): this profile initializes the attenuators so the paths between gNB 1 and `ue1` have the minimum attenuation and all other paths the maximum. Confirm the serving cell and PLMN, and ping the UPF:
-
-```
-# on the ue node
-cd /local/repository && uv run bin/ue_metrics.py
-
-# on the ue node
-ping 10.45.0.1
-```
-
-Bring gNB 2's cell up at `ue1` with the attenuators and run a network scan: the modem should see the foreign-PLMN cell but stay registered on gNB 1, since 001/01 is not its home network in SA.
-
-```
-# on the cudu node
-/local/repository/bin/update-attens gnb2ue1 0
-
-# on the ue node
-cd /local/repository && uv run bin/quectel_control.py scan
-```
-
-Notes: the gains (`att_tx`, `att_rx`, `max_rxgain` in the `RUs` section of `etc/oai/*.conf`) are OAI's stock values for each radio and may need adjusting. `bin/start-oai-gnb -c external` switches a radio to the external 10 MHz reference. The foreign PLMN is set in `etc/oai/gnb2_n300_core2.conf` (gNB broadcast) and passed to `bin/deploy-open5gs.sh` for `cn5g2` (core); change both together. `bin/update-attens gnb2ue1|gnb2ue2` assumes the first eight N300 paths belong to `ue1` and the rest to `ue2`; check against `bin/atten -l`.
-
+Notes: the LTE band / EARFCN, PLMN and TAC are set in the eNB configs under `etc/oai-lte/` (eNB broadcast) and passed to the EPC deploy script for `epc2` (core); change them together. The radio gains (`att_tx`, `att_rx`, `max_rxgain`) are OAI's stock values per radio and may need tuning, exactly as in the 5G profile.
 """
 
 BIN_PATH = "/local/repository/bin"
@@ -101,20 +82,20 @@ ETC_PATH = "/local/repository/etc"
 UBUNTU_IMG = "urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU22-64-STD"
 COTS_UE_IMG = "urn:publicid:IDN+emulab.net+image+PowderTeam:cots-jammy-image"
 COMP_MANAGER_ID = "urn:publicid:IDN+emulab.net+authority+cm"
-# OAI develop as of 2026-10-04; the configs in etc/oai are derived from the
-# reference configs of this revision.
+# OAI develop as of 2026-10-04 (same checkout as the 5G profile; the LTE configs
+# in etc/oai-lte are derived from the reference eNB configs of this revision).
 DEFAULT_OAI_HASH = "f8f769592a7030be88ede4bb5ca66fa1ca6a80e0"
-OPEN5GS_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-open5gs.sh")
-OAI_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-oai.sh")
-# PLMN broadcast by gNB 2 and its own core (cn5g2): the same 999/99 as core 1,
-# a second, unconnected network of the same operator. It must match plmn_list
-# in etc/oai/gnb2_n300_core2.conf. Given as separate MCC/MNC digit strings so
-# leading zeros would survive into the Open5GS config.
+# Open5GS in EPC mode (MME/SGW-C/SGW-U/PGW-C.../HSS); no args = home EPC 1
+# (999/99, TAC 1), "<mcc> <mnc> <tac>" = a second EPC on another node.
+EPC_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-open5gs-epc.sh")
+# Builds OAI lte-softmodem (and applies the LTE FBS misbehaviour patch when
+# present), then copies the eNB configs; mirrors deploy-oai.sh for 4G.
+OAI_LTE_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-oai-lte.sh")
+# PLMN/TAC broadcast by eNB 2 and its own core (epc2): same 999/99 as EPC 1 but
+# a DIFFERENT TAC, so an idle UE that reselects to the FBS performs a TAU/attach
+# on EPC 2. Must match the plmn/tac in etc/oai-lte/enb2_n300_epc2.conf.
 CORE2_MCC = "999"
 CORE2_MNC = "99"
-# The FBS core serves a different tracking area than the home core (TAC 1), so
-# the UE triggers mobility registration after idle-reselecting to the FBS. Must
-# match tracking_area_code in etc/oai/gnb2_n300_core2.conf.
 CORE2_TAC = "2"
 NODE_IDS = {
     "sdru": "x310-1",
@@ -139,7 +120,7 @@ node_types = [
 ]
 pc.defineParameter(
     name="sdru_nodetype",
-    description="Type of compute node paired with the RU SDR",
+    description="Type of compute node paired with the home eNB SDR",
     typ=portal.ParameterType.STRING,
     defaultValue=node_types[1],
     legalValues=node_types
@@ -147,7 +128,7 @@ pc.defineParameter(
 
 pc.defineParameter(
     name="sdru2_nodetype",
-    description="Type of compute node paired with the second gNB's SDR",
+    description="Type of compute node paired with the FBS eNB SDR",
     typ=portal.ParameterType.STRING,
     defaultValue=node_types[1],
     legalValues=node_types
@@ -155,7 +136,7 @@ pc.defineParameter(
 
 pc.defineParameter(
     name="cn_nodetype",
-    description="Type of compute node to use for CN node",
+    description="Type of compute node to use for each EPC node",
     typ=portal.ParameterType.STRING,
     defaultValue=node_types[0],
     legalValues=node_types
@@ -171,7 +152,7 @@ pc.defineParameter(
 
 pc.defineParameter(
     name="oai_commit_hash",
-    description="Commit hash, branch or tag for OAI (openairinterface5g)",
+    description="Commit hash, branch or tag for OAI (openairinterface5g; also builds lte-softmodem)",
     typ=portal.ParameterType.STRING,
     defaultValue="",
     advanced=True
@@ -197,7 +178,8 @@ for k, v in MATRIX_GRAPH.items():
 
 request = pc.makeRequestRSpec()
 
-role = "cn5g"
+# Home EPC (Open5GS EPC mode), 999/99 TAC 1.
+role = "epc"
 cn_node = request.RawPC(role)
 cn_node.component_manager_id = COMP_MANAGER_ID
 cn_node.hardware_type = params.cn_nodetype
@@ -207,12 +189,12 @@ cn_if.addAddress(pg.IPv4Address("192.168.1.1", "255.255.255.0"))
 cn_link = request.Link("{}-link".format(role))
 cn_link.setNoBandwidthShaping()
 cn_link.addInterface(cn_if)
-cn_node.addService(pg.Execute(shell="bash", command=OPEN5GS_DEPLOY_SCRIPT))
+cn_node.addService(pg.Execute(shell="bash", command=EPC_DEPLOY_SCRIPT))
 
-# Second, independent core for gNB 2: its own Open5GS broadcasting the same
-# PLMN as core 1. The deploy script binds NGAP and N3 to this node's 192.168.1.4 and
-# provisions subscribers under CORE2_MCC/CORE2_MNC.
-role = "cn5g2"
+# FBS EPC: its own Open5GS EPC, same PLMN as EPC 1 but a different TAC. The
+# deploy script binds S1AP/S1-U to this node's 192.168.1.4 and provisions the
+# same subscribers under CORE2_MCC/CORE2_MNC.
+role = "epc2"
 cn2_node = request.RawPC(role)
 cn2_node.component_manager_id = COMP_MANAGER_ID
 cn2_node.hardware_type = params.cn_nodetype
@@ -220,39 +202,40 @@ cn2_node.disk_image = UBUNTU_IMG
 cn2_if = cn2_node.addInterface("{}-if".format(role))
 cn2_if.addAddress(pg.IPv4Address("192.168.1.4", "255.255.255.0"))
 cn_link.addInterface(cn2_if)
-cn2_cmd = "{} {} {} {}".format(OPEN5GS_DEPLOY_SCRIPT, CORE2_MCC, CORE2_MNC, CORE2_TAC)
+cn2_cmd = "{} {} {} {}".format(EPC_DEPLOY_SCRIPT, CORE2_MCC, CORE2_MNC, CORE2_TAC)
 cn2_node.addService(pg.Execute(shell="bash", command=cn2_cmd))
 
 # collect node objects for RF matrix
 matrix_nodes = {}
 
-node_name = "cudu"
-cudu = request.RawPC(node_name)
-cudu.component_manager_id = COMP_MANAGER_ID
-cudu.hardware_type = params.sdru_nodetype
-if params.sdr_compute_image:
-    cudu.disk_image = params.sdr_compute_image
-else:
-    cudu.disk_image = UBUNTU_IMG
-cudu_cn_if = cudu.addInterface("{}-cn-if".format(node_name))
-cudu_cn_if.addAddress(pg.IPv4Address("192.168.1.2", "255.255.255.0"))
-cn_link.addInterface(cudu_cn_if)
-node_sdr_if = cudu.addInterface("usrp_if")
-node_sdr_if.addAddress(pg.IPv4Address("192.168.30.1", "255.255.255.0"))
-sdr_link = request.Link("{}-sdr-link".format(node_name))
-# sdr_link.bandwidth = 10*1000*1000
-sdr_link.addInterface(node_sdr_if)
 if params.oai_commit_hash:
     oai_hash = params.oai_commit_hash
 else:
     oai_hash = DEFAULT_OAI_HASH
-cmd = "{} '{}'".format(OAI_DEPLOY_SCRIPT, oai_hash)
-cudu.addService(pg.Execute(shell="bash", command=cmd))
-cudu.addService(pg.Execute(shell="bash", command="/local/repository/bin/tune-sdr-iface.sh"))
-cudu.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens ru1ue1 0"))
-cudu.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens ru2ue1 95"))
-cudu.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens ru1ue2 95"))
-cudu.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens ru2ue2 95"))
+enb_build_cmd = "{} '{}'".format(OAI_LTE_DEPLOY_SCRIPT, oai_hash)
+
+# Home eNB (X310) -> EPC 1.
+node_name = "enb1"
+enb1 = request.RawPC(node_name)
+enb1.component_manager_id = COMP_MANAGER_ID
+enb1.hardware_type = params.sdru_nodetype
+if params.sdr_compute_image:
+    enb1.disk_image = params.sdr_compute_image
+else:
+    enb1.disk_image = UBUNTU_IMG
+enb1_cn_if = enb1.addInterface("{}-cn-if".format(node_name))
+enb1_cn_if.addAddress(pg.IPv4Address("192.168.1.2", "255.255.255.0"))
+cn_link.addInterface(enb1_cn_if)
+node_sdr_if = enb1.addInterface("usrp_if")
+node_sdr_if.addAddress(pg.IPv4Address("192.168.30.1", "255.255.255.0"))
+sdr_link = request.Link("{}-sdr-link".format(node_name))
+sdr_link.addInterface(node_sdr_if)
+enb1.addService(pg.Execute(shell="bash", command=enb_build_cmd))
+enb1.addService(pg.Execute(shell="bash", command="/local/repository/bin/tune-sdr-iface.sh"))
+enb1.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens ru1ue1 0"))
+enb1.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens ru2ue1 95"))
+enb1.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens ru1ue2 95"))
+enb1.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens ru2ue2 95"))
 
 node_name = "sdru"
 sdru = request.RawPC("{}-sdr".format(node_name))
@@ -261,26 +244,26 @@ sdr_link.addNode(sdru)
 sdru.Desire("rf-controlled", 1)
 matrix_nodes[node_name] = sdru
 
-node_name = "cudu2"
-cudu2 = request.RawPC(node_name)
-cudu2_cn_if = cudu2.addInterface("{}-cn-if".format(node_name))
-cudu2_cn_if.addAddress(pg.IPv4Address("192.168.1.3", "255.255.255.0"))
-cn_link.addInterface(cudu2_cn_if)
-cudu2.component_manager_id = COMP_MANAGER_ID
-cudu2.hardware_type = params.sdru2_nodetype
+# FBS eNB (N300) -> EPC 2.
+node_name = "enb2"
+enb2 = request.RawPC(node_name)
+enb2_cn_if = enb2.addInterface("{}-cn-if".format(node_name))
+enb2_cn_if.addAddress(pg.IPv4Address("192.168.1.3", "255.255.255.0"))
+cn_link.addInterface(enb2_cn_if)
+enb2.component_manager_id = COMP_MANAGER_ID
+enb2.hardware_type = params.sdru2_nodetype
 if params.sdr_compute_image:
-    cudu2.disk_image = params.sdr_compute_image
+    enb2.disk_image = params.sdr_compute_image
 else:
-    cudu2.disk_image = UBUNTU_IMG
-node_sdr_if = cudu2.addInterface("{}-sdr-if".format(node_name))
+    enb2.disk_image = UBUNTU_IMG
+node_sdr_if = enb2.addInterface("{}-sdr-if".format(node_name))
 node_sdr_if.addAddress(pg.IPv4Address("192.168.10.1", "255.255.255.0"))
 sdr_link = request.Link("{}-sdr-link".format(node_name))
-# sdr_link.bandwidth = 10*1000*1000
 sdr_link.addInterface(node_sdr_if)
-cudu2.addService(pg.Execute(shell="bash", command=cmd))
-cudu2.addService(pg.Execute(shell="bash", command="/local/repository/bin/tune-sdr-iface.sh"))
-cudu2.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens gnb2ue1 95"))
-cudu2.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens gnb2ue2 95"))
+enb2.addService(pg.Execute(shell="bash", command=enb_build_cmd))
+enb2.addService(pg.Execute(shell="bash", command="/local/repository/bin/tune-sdr-iface.sh"))
+enb2.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens gnb2ue1 95"))
+enb2.addService(pg.Execute(shell="bash", command="/local/repository/bin/update-attens gnb2ue2 95"))
 
 node_name = "sdru2"
 sdru2 = request.RawPC("{}-sdr".format(node_name))
@@ -289,7 +272,7 @@ sdr_link.addNode(sdru2)
 sdru2.Desire("rf-controlled", 1)
 matrix_nodes[node_name] = sdru2
 
-# ue nodes with COTS UE and B210
+# COTS UE nodes (Quectel RM520, run in LTE mode).
 node_name = "ue1"
 ue1 = request.RawPC(node_name)
 ue1.component_manager_id = COMP_MANAGER_ID
