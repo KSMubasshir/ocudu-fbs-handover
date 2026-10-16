@@ -70,3 +70,25 @@ manual restarts -- always confirm a single instance (`pgrep -xc lte-softmodem`
 
 Known-good capture method: S1AP on an EPC with `bin/s1ap-capture`, decode with
 `tshark -r <pcap> -Y s1ap`; MME NAS flow via `journalctl -u open5gs-mmed`.
+
+## Update (second live session): attach still not stable; what helped and hurt
+
+Tried to drive a clean attach to unblock the three experiments. Findings:
+- **50 PRB (10 MHz) got furthest**: in an isolated home-only test the full NAS
+  attach completed to Attach Accept + default bearer. **25 PRB (5 MHz) regressed**
+  -- the UE did not camp / sent no S1AP at all. Reverted the configs to 50 PRB.
+- **Do not over-manipulate the modem.** `AT+CFUN=1,1` (reset) and `AT+CGATT=0`
+  before attach left the UE not attaching at all. The plain flow
+  (set LTE mode, airplane cycle via module-airplane/module-on) reached furthest.
+- **OAI lte-softmodem runs as 2 processes** (a normal fork), not a duplicate.
+  Count real instances with `pgrep -xc lte-softmodem` (exact name), never
+  `pgrep -cf` (that also counts the sudo/numactl wrappers). Earlier "duplicate
+  instance" worries were a counting artifact.
+- Net: attach is flaky run to run. Best-known-good is 50 PRB + the plain modem
+  flow + MME restarted for a clean context; from there the open problem is the
+  UE not finalising registration after Attach Accept (Attach Complete / final
+  RRC reconfiguration). Treat it as systematic stabilisation, not one more tweak.
+
+The three experiments (benign handover, FBS idle reselection, FBS connected) and
+their trace/packet/measurement collection all remain blocked on this one stable
+attach; nothing else about them is known-broken.
