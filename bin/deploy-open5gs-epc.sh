@@ -66,6 +66,13 @@ if [ -n "$LANIP" ]; then
     # PFCP endpoint on loopback so SGW-C's PFCP client still reaches it.
     sudo sed -i "/gtpu:/,\$ s/address: 127.0.0.6/address: $LANIP/" /etc/open5gs/sgwu.yaml
 fi
+# The UPF (PGW-U) GTP-U must NOT share the SGW-U's LAN address: in 4G both are
+# separate daemons and both bind UDP 2152, so if the UPF is also on 192.168.1.x
+# it fails with "Address already in use" and no data session can be created.
+# Keep the UPF internal on loopback (the repo upf.yaml ships it on the LAN IP for
+# the 5G N3 path); the eNB's S1-U reaches the SGW-U, and the SGW-U reaches the
+# UPF over S5-U on the same node.
+sudo sed -i "/gtpu:/,/metrics:/ s/address: 192\.168\.1\.[0-9]*/address: 127.0.0.7/" /etc/open5gs/upf.yaml
 # PLMN this EPC serves (MME gummei + TAI). The repo mme.yaml ships 999/70; set
 # it to MCC/MNC so it matches the provisioned subscribers and the eNB broadcast.
 sudo sed -i -e "s/mcc: 999/mcc: $MCC/g" -e "s/mnc: 70/mnc: $MNC/g" /etc/open5gs/mme.yaml
